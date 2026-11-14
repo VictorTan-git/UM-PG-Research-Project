@@ -1,0 +1,1807 @@
+---
+title: "Spatial Random Forest Application"
+author: "Victor Tan"
+date: "2026-04-29"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r Data Cleansing}
+# ==============================================================================
+# DATA CLEANSING & FEATURE ENGINEERING (EXPANDED ARBITRAGE UNIVERSE)
+# ==============================================================================
+
+library(dplyr)
+library(spatialRF)
+library(parallel)
+library(lightgbm)
+library(stats) 
+
+file_path <- "C:/Users/user/Desktop/UM/OneDrive - Universiti Malaya/SQB7038 Research Project/Dataset/Global AI Job Market & Salary Trends 2025/ai_job_dataset1.csv"
+job_data <- read.csv(file_path)
+
+# 3. EXPANDED ECONOMIC LOOKUP TABLE (52 Countries Total)
+# All indices uniformly updated to 2025 releases to ensure stable covariance 
+econ_lookup <- data.frame(
+  company_location = c(
+    # Original 28 Countries
+    "United States", "United Kingdom", "Germany", "Canada", "India", 
+    "France", "Spain", "Australia", "Netherlands", "Singapore",
+    "Republic of Korea", "Brazil", "Japan", "United Arab Emirates", 
+    "Mexico", "Poland", "Italy", "Switzerland", "Greece", "Malaysia",
+    "China", "Denmark", "Israel", "Ireland", "Norway", "Sweden", 
+    "Finland", "Austria",
+    # 24 New Remote Residence Countries
+    "Argentina", "Belgium", "Chile", "Colombia", "Czech Republic", "Egypt", 
+    "Estonia", "Ghana", "Hungary", "Indonesia", "Kenya", "Latvia", 
+    "Luxembourg", "New Zealand", "Nigeria", "Philippines", "Portugal", 
+    "Romania", "Russia", "South Africa", "Thailand", "Turkey", "Ukraine", "Vietnam"
+  ),
+  
+  # IMF WEO Oct 2024 (Projections for 2025 in USD Thousands)
+  gdp_pc = c(
+    89.105, 54.949, 55.911, 53.558, 2.878, 46.792, 36.192, 64.547, 70.480, 92.932, 
+    34.642, 9.964, 33.956, 49.498, 12.692, 26.805, 41.091, 104.896, 25.756, 13.145, 
+    13.687, 74.969, 57.760, 108.919, 89.694, 58.100, 54.163, 58.192, 
+    14.362, 57.772, 17.015, 8.054, 33.039, 3.174, 32.760, 2.519, 24.809, 5.027, 
+    2.468, 24.374, 140.941, 46.126, 0.807, 4.350, 30.002, 21.421, 14.258, 6.397, 
+    7.767, 16.709, 6.261, 4.806
+  ),
+             
+  # Numbeo 2025 Cost of Living Index
+  cost_of_living = c(
+    64.9, 59.2, 58.4, 58.7, 19.5, 58.0, 43.5, 60.9, 60.5, 79.1,
+    56.5, 25.6, 45.6, 54.1, 34.5, 38.9, 51.0, 98.4, 46.5, 29.7,
+    30.7, 66.9, 65.2, 59.8, 69.0, 54.2, 58.7, 60.7,
+    35.7, 56.5, 35.1, 26.0, 42.6, 19.0, 49.4, 30.6, 36.6, 24.6, 
+    28.2, 43.4, 64.8, 55.3, 26.4, 28.8, 41.2, 34.0, 22.3, 30.0, 
+    33.7, 34.7, 24.6, 26.6
+  ),
+                   
+  # Observer Global AI Index 2025 (Standardized to Overall Global Rank; 1 = Highest)
+  tech_index = c(
+    1, 4, 9, 8, 17, 6, 22, 21, 13, 3, 
+    5, 25, 11, 10, 76, 37, 28, 12, 31, 24, 
+    2, 18, 7, 23, 20, 19, 15, 32, 
+    77, 33, 46, 53, 43, 47, 26, 61, 34, 45, 
+    74, 60, 27, 35, 69, 48, 41, 50, 29, 54, 
+    42, 49, 64, 40
+  ),
+  
+  # INSEAD GTCI 2025 Index Scores
+  human_capital_index = c(
+    69.41, 67.52, 65.73, 66.40, 34.03, 62.88, 59.32, 69.27, 70.26, 73.29, 
+    58.08, 44.04, 58.59, 59.36, 43.67, 53.70, 57.35, 73.14, 52.38, 50.20, 
+    48.65, 72.05, 60.16, 68.73, 69.84, 70.76, 71.06, 65.86, 
+    47.59, 66.05, 52.66, 43.94, 62.52, 36.62, 61.92, 33.43, 52.80, 41.18, 
+    34.30, 54.59, 69.84, 64.16, 30.51, 42.39, 59.90, 48.24, 46.09, 41.19, 
+    41.93, 40.96, 46.31, 42.25
+  )
+)
+
+# 4. DATA PRE-PROCESSING, JOINING & ECONOMIC ARBITRAGE 
+
+# ==============================================================================
+# SUPERVISOR FEEDBACK #1: Capture Remote Work & Dual-Location Gaps
+# Remark: "Introducing an economic arbitrage feature (e.g., ratio or distance between 
+# company_location GDP/cost of living and employee_residence GDP/cost of living) 
+# would capture cross-border remote pay adjustments."
+# ==============================================================================
+
+job_data <- job_data %>%
+  mutate(
+    company_location = case_when(
+      company_location == "United States of America" ~ "United States",
+      company_location == "South Korea" ~ "Republic of Korea",
+      TRUE ~ company_location
+    ),
+    employee_residence = case_when(
+      employee_residence == "United States of America" ~ "United States",
+      employee_residence == "South Korea" ~ "Republic of Korea",
+      TRUE ~ employee_residence
+    )
+  )
+
+# A. Join Macro Data for the Company Location
+job_data_econ <- job_data %>%
+  left_join(econ_lookup, by = "company_location") %>%
+  filter(!is.na(gdp_pc)) 
+
+# B. Join Macro Data for the Employee Residence (to calculate Arbitrage)
+econ_lookup_emp <- econ_lookup %>%
+  rename(
+    employee_residence = company_location,
+    emp_gdp_pc = gdp_pc,
+    emp_cost_of_living = cost_of_living
+  ) %>%
+  select(employee_residence, emp_gdp_pc, emp_cost_of_living)
+
+job_data_econ <- job_data_econ %>%
+  left_join(econ_lookup_emp, by = "employee_residence") %>%
+  # Fallback logic retained strictly for unmapped future test data, 
+  # but will not trigger for our defined 52 countries.
+  mutate(
+    emp_gdp_pc = ifelse(is.na(emp_gdp_pc), gdp_pc, emp_gdp_pc),
+    emp_cost_of_living = ifelse(is.na(emp_cost_of_living), cost_of_living, emp_cost_of_living)
+  ) %>%
+  # C. Create Arbitrage Features based on Supervisor Feedback #1
+  mutate(
+    arbitrage_gdp_ratio = gdp_pc / emp_gdp_pc,
+    arbitrage_col_ratio = cost_of_living / emp_cost_of_living
+  )
+
+# 5. CATEGORICAL TO NUMERICAL TRANSFORMATION
+job_data_econ <- job_data_econ %>%
+  mutate(
+    company_size_num = case_when(
+      company_size == "S" ~ 1,
+      company_size == "M" ~ 2,
+      company_size == "L" ~ 3,
+      TRUE ~ 0
+    ),
+    education_num = case_when(
+      education_required == "Associate" ~ 1,
+      education_required == "Bachelor"  ~ 2,
+      education_required == "Master"    ~ 3,
+      education_required == "PhD"       ~ 4,
+      TRUE ~ 0
+    )
+  )
+
+industry_dummies <- model.matrix(~ industry - 1, data = job_data_econ)
+colnames(industry_dummies) <- make.names(colnames(industry_dummies))
+job_data_econ <- cbind(job_data_econ, industry_dummies)
+
+
+# ==============================================================================
+# 6. SPATIAL BLOCK CROSS-VALIDATION & MEM LEAKAGE PREVENTION
+# ==============================================================================
+
+# ==============================================================================
+# SUPERVISOR FEEDBACK #2: Refine the Economic Distance Metric
+# Remark: "Replacing Euclidean distance with Mahalanobis distance (which accounts 
+# for feature covariance) would yield a more realistic spatial connectivity weight W."
+# 
+# SUPERVISOR FEEDBACK #4: Prevent Potential Data Leakage in MEM Extraction
+# Remark: "Ensure that MEM spatial eigenvectors are generated and selected strictly 
+# within training folds and then projected onto validation folds, rather than 
+# calculated across the entire dataset prior to splitting..."
+#
+# Implementation Note: The global Euclidean distance matrix creation has been 
+# completely removed from this cleansing script. Mahalanobis distance calculation 
+# and MEM extraction are deferred to the training loops in the modeling scripts.
+# ==============================================================================
+
+
+# ==============================================================================
+# SUPERVISOR FEEDBACK #3: Adopt Spatial Block Cross-Validation
+# Remark: "Implementing Spatial Block CV or Leave-One-Country-Out (LOCO) CV will 
+# rigorously test the model's ability to generalize to entirely unseen countries 
+# and regions."
+# ==============================================================================
+set.seed(123)
+unique_countries <- unique(job_data_econ$company_location)
+
+# Assign entire countries to folds rather than stratifying rows, satisfying LOCO CV
+country_folds <- data.frame(
+  company_location = unique_countries,
+  fold = sample(1:5, length(unique_countries), replace = TRUE)
+)
+
+job_data_econ <- job_data_econ %>%
+  left_join(country_folds, by = "company_location")
+```
+
+```{r EDA}
+# ==============================================================================
+# EXPLORATORY DATA ANALYSIS (EDA): GLOBAL AI SALARY DATASET
+# ==============================================================================
+# Ensures memory efficiency for 20GB Windows RAM constraints
+gc() 
+
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(corrplot)
+library(skimr)
+library(gridExtra)
+
+# 1. INITIAL DATA OVERVIEW & SUMMARY STATISTICS
+# ------------------------------------------------------------------------------
+# Assuming the raw dataset is loaded as 'job_data_econ'
+cat("=== Dataset Structure ===\n")
+glimpse(job_data_econ)
+
+cat("\n=== Comprehensive Statistical Summary ===\n")
+# skimr provides a publication-ready summary for Master's level statistical reporting
+skim(job_data_econ)
+
+# Create the log-transformed target variable for comparison
+job_data_econ <- job_data_econ %>%
+  mutate(log_salary_usd = log(salary_usd))
+
+# 2. TARGET VARIABLE DISTRIBUTIONS (RAW VS LOG-TRANSFORMED)
+# ------------------------------------------------------------------------------
+p1 <- ggplot(job_data_econ, aes(x = salary_usd)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "black", alpha = 0.7) +
+  theme_minimal() +
+  labs(title = "Distribution of AI Job Salaries (Raw USD)", 
+       x = "Salary (USD)", y = "Frequency")
+
+p2 <- ggplot(job_data_econ, aes(x = log_salary_usd)) +
+  geom_histogram(bins = 50, fill = "darkred", color = "black", alpha = 0.7) +
+  theme_minimal() +
+  labs(title = "Distribution of AI Job Salaries (Log-Transformed)", 
+       x = "Log(Salary USD)", y = "Frequency")
+
+grid.arrange(p1, p2, ncol = 2)
+
+# 3. CORRELATION ANALYSIS (CONTINUOUS & MACRO VARIABLES)
+# ------------------------------------------------------------------------------
+# Select numerical features central to the comb_1 to comb_4 ablation combinations
+continuous_vars <- job_data_econ %>%
+  select(salary_usd, log_salary_usd, years_experience, remote_ratio, 
+         company_size_num, education_num, benefits_score, 
+         gdp_pc, cost_of_living, tech_index, human_capital_index) %>%
+  na.omit()
+
+cor_matrix <- cor(continuous_vars, method = "pearson")
+
+# Generate a visually intuitive correlation plot for thesis reporting
+corrplot(cor_matrix, method = "color", type = "upper", 
+         tl.col = "black", tl.srt = 45, addCoef.col = "black", 
+         number.cex = 0.7, diag = FALSE, 
+         title = "Pearson Correlation Matrix of AI Salary and Economic Indicators",
+         mar = c(0,0,1,0))
+
+# 4. MACROECONOMIC RELATIONSHIPS (BIVARIATE ANALYSIS)
+# ------------------------------------------------------------------------------
+# Evaluating how base economic structures (comb_1 & comb_2) correlate with log wages
+p3 <- ggplot(job_data_econ, aes(x = gdp_pc, y = log_salary_usd)) +
+  geom_point(alpha = 0.5, color = "purple") +
+  geom_smooth(method = "lm", color = "black", linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Log Salary vs. GDP per Capita (comb_1 base)", 
+       x = "GDP per Capita", y = "Log(Salary USD)")
+
+p4 <- ggplot(job_data_econ, aes(x = cost_of_living, y = log_salary_usd)) +
+  geom_point(alpha = 0.5, color = "darkgreen") +
+  geom_smooth(method = "lm", color = "black", linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Log Salary vs. Cost of Living", 
+       x = "Cost of Living Index", y = "Log(Salary USD)")
+
+grid.arrange(p3, p4, ncol = 2)
+
+# 5. SPATIAL / GEOGRAPHIC WAGE DISPERSION
+# ------------------------------------------------------------------------------
+# Boxplot of log salaries across the 20 country locations
+# Ordered by median salary to highlight structural global inequalities
+ggplot(job_data_econ, aes(x = reorder(company_location, log_salary_usd, FUN = median), 
+                          y = log_salary_usd)) +
+  geom_boxplot(fill = "orange", alpha = 0.6, outlier.color = "red") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Global AI Compensation Distribution by Country",
+       subtitle = "Ranked by Median Log Salary",
+       x = "Company Location",
+       y = "Log(Salary USD)") +
+  theme(axis.text.y = element_text(size = 9))
+
+# Clean up memory allocation after EDA execution
+gc()
+```
+
+```{r Feature Selection}
+# ==============================================================================
+# SCRIPT: Feature Exclusion Diagnostics 
+# PURPOSE: To mathematically justify the removal of non-predictive variables
+# ==============================================================================
+
+# 1. LOAD LIBRARIES & DATA
+library(dplyr)
+library(stats)
+
+file_path <- "C:/Users/user/Desktop/UM/OneDrive - Universiti Malaya/SQB7038 Research Project/Dataset/Global AI Job Market & Salary Trends 2025/ai_job_dataset1.csv"
+job_data <- read.csv(file_path)
+n_rows <- nrow(job_data)
+
+# ==============================================================================
+# 2. HIGH CARDINALITY (job_id, required_skills)
+# ==============================================================================
+# Calculate cardinality ratio: Unique values / Total Rows
+unique_job_id <- length(unique(job_data$job_id))
+unique_skills <- length(unique(job_data$required_skills))
+
+cat("Cardinality Ratio for job_id:", unique_job_id / n_rows, 
+    "(", unique_job_id, "unique values across", n_rows, "rows )\n")
+cat("Cardinality Ratio for required_skills:", unique_skills / n_rows, 
+    "(", unique_skills, "unique values across", n_rows, "rows )\n\n")
+
+
+# ==============================================================================
+# 3. SPATIAL REDUNDANCY (employee_residence vs company_location)
+# ==============================================================================
+# Calculate direct identity match rate
+match_count <- sum(job_data$company_location == job_data$employee_residence)
+cat("Spatial Redundancy Match Rate:", round((match_count / n_rows) * 100, 2), "%\n\n")
+
+
+# ==============================================================================
+# 4. STRUCTURAL MULTICOLLINEARITY (One-Way ANOVA)
+# ==============================================================================
+# Compare continuous years_experience across categorical experience_level
+anova_exp <- aov(years_experience ~ experience_level, data = job_data)
+cat("ANOVA - years_experience vs experience_level:\n")
+print(summary(anova_exp)) # Yields F-value and p-value
+cat("\n")
+
+
+# ==============================================================================
+# 5. PERFECT MULTICOLLINEARITY / DATA LEAKAGE (Pearson)
+# ==============================================================================
+# Filter for USD to test exact collinearity without exchange rate noise
+usd_data <- job_data %>% filter(salary_currency == "USD")
+corr_salary <- cor(usd_data$salary_usd, usd_data$salary_local, method = "pearson")
+cat("Pearson Correlation (salary_usd & salary_local in USD):", corr_salary, "\n\n")
+
+
+# ==============================================================================
+# 6. TEMPORAL & ADMINISTRATIVE ARTIFACTS (Pearson)
+# ==============================================================================
+# # Convert dates to numerical timestamps (seconds since epoch) to calculate linear correlation
+# job_data$posting_ts <- as.numeric(as.POSIXct(job_data$posting_date))
+# job_data$deadline_ts <- as.numeric(as.POSIXct(job_data$application_deadline))
+# 
+# corr_length <- cor(job_data$salary_usd, job_data$job_description_length, method = "pearson")
+# corr_posting <- cor(job_data$salary_usd, job_data$posting_ts, method = "pearson")
+# corr_deadline <- cor(job_data$salary_usd, job_data$deadline_ts, method = "pearson")
+# 
+# cat("Pearson Correlation - job_description_length:", corr_length, "\n")
+# cat("Pearson Correlation - posting_date (timestamp):", corr_posting, "\n")
+# cat("Pearson Correlation - application_deadline (timestamp):", corr_deadline, "\n\n")
+
+
+# ==============================================================================
+# 7. NON-PREDICTIVE NOMINAL GROUPINGS (Univariate Categorical Regression)
+# ==============================================================================
+# Function to cleanly extract R-squared and overall p-value from linear model
+extract_regression_metrics <- function(model_summary) {
+  r_squared <- model_summary$r.squared
+  f_stat <- model_summary$fstatistic
+  
+  # Calculate p-value and forcefully strip hidden names using unname()
+  p_value <- unname(pf(f_stat[1], f_stat[2], f_stat[3], lower.tail = FALSE))
+  
+  # Return with clean names
+  return(c(R_squared = r_squared, p_value = p_value))
+}
+
+# 7A. Regression for job_title
+lm_job_title <- lm(salary_usd ~ job_title, data = job_data)
+summary_job <- summary(lm_job_title)
+metrics_job <- extract_regression_metrics(summary_job)
+
+cat("Categorical Regression - job_title:\n")
+cat("R-squared:", round(metrics_job["R_squared"], 4), "\n")
+cat("p-value:", round(metrics_job["p_value"], 4), "\n\n")
+
+# 7B. Regression for employment_type
+lm_emp_type <- lm(salary_usd ~ employment_type, data = job_data)
+summary_emp <- summary(lm_emp_type)
+metrics_emp <- extract_regression_metrics(summary_emp)
+
+cat("Categorical Regression - employment_type:\n")
+cat("R-squared:", round(metrics_emp["R_squared"], 4), "\n")
+cat("p-value:", round(metrics_emp["p_value"], 4), "\n")
+```
+
+```{r General Spatial Effect Analysis}
+# ==============================================================================
+# SCRIPT: Multi-Combination Economic ESDA (comb_1 to comb_4)
+# PURPOSE: Calculate Global Moran's I and generate outputs separately for each combination
+# ==============================================================================
+
+# 1. LOAD REQUIRED LIBRARIES
+library(dplyr)
+library(sf)           # For handling spatial geometries
+library(spdep)        # For spatial weights and Moran's I calculation
+library(rnaturalearth)# For global country polygons and coordinates
+library(ggplot2)      # For choropleth mapping
+
+# 2. LOAD AND PREPARE THE DATA
+file_path <- "C:/Users/user/Desktop/UM/OneDrive - Universiti Malaya/SQB7038 Research Project/Dataset/Global AI Job Market & Salary Trends 2025/ai_job_dataset1.csv"
+job_data <- read.csv(file_path)
+
+# Harmonize country names to match rnaturalearth 'admin' field exactly
+job_data <- job_data %>%
+  mutate(company_location = case_when(
+    company_location == "United States of America" ~ "United States",
+    company_location == "South Korea" ~ "Republic of Korea",
+    TRUE ~ company_location
+  ))
+
+# 3. DEFINE ECONOMIC VALUES & ABLATION COMBINATIONS
+econ_lookup <- data.frame(
+  company_location = c("United States", "United Kingdom", "Germany", "Canada", "India", 
+                       "France", "Spain", "Australia", "Netherlands", "Singapore",
+                       "Republic of Korea", "Brazil", "Japan", "United Arab Emirates", 
+                       "Mexico", "Poland", "Italy", "Switzerland", "Greece", "Malaysia",
+                       "China", "Denmark", "Israel", "Ireland", "Norway", "Sweden", 
+                       "Finland", "Austria"),
+  gdp_pc              = c(95.2, 61.1, 65.7, 58.4, 2.8, 50.5, 37.1, 71.3, 70.2, 109.1, 
+                          37.5, 12.5, 36.2, 57.1, 17.5, 25.4, 42.0, 110.5, 26.5, 15.0,
+                          15.5, 75.0, 58.0, 115.0, 95.0, 60.5, 57.0, 62.5),
+  cost_of_living      = c(64.9, 59.2, 58.4, 58.7, 19.5, 58.0, 43.5, 60.9, 60.5, 79.1,
+                          56.5, 25.6, 45.6, 54.1, 34.5, 38.9, 51.0, 98.4, 46.5, 29.7,
+                          30.7, 66.9, 65.2, 59.8, 69.0, 54.2, 58.7, 60.7),
+  tech_index          = c(100.0, 38.0, 25.0, 28.5, 21.0, 24.5, 19.5, 21.0, 22.0, 35.0,
+                          26.5, 17.5, 24.0, 23.5, 14.5, 15.5, 21.5, 25.5, 13.5, 14.5,
+                          60.0, 21.5, 29.0, 19.5, 20.5, 22.5, 23.5, 19.0),
+  human_capital_index = c(75, 74, 72, 73, 45, 71, 68, 75, 77, 80,
+                          70, 48, 71, 65, 47, 62, 66, 79, 60, 61,
+                          55, 78, 70, 74, 76, 77, 78, 72)
+)
+
+macro_combinations <- list(
+  comb_1 = c("gdp_pc"),
+  comb_2 = c("gdp_pc", "cost_of_living"),
+  comb_3 = c("gdp_pc", "cost_of_living", "tech_index"),
+  comb_4 = c("gdp_pc", "cost_of_living", "tech_index", "human_capital_index")
+)
+
+# Aggregate country summary dataset
+country_summary <- job_data %>%
+  left_join(econ_lookup, by = "company_location") %>%
+  group_by(company_location) %>%
+  summarise(
+    mean_raw_salary     = mean(salary_usd, na.rm = TRUE),
+    gdp_pc              = first(gdp_pc),
+    cost_of_living      = first(cost_of_living),
+    tech_index          = first(tech_index),
+    human_capital_index = first(human_capital_index),
+    job_count           = n()
+  ) %>%
+  filter(!is.na(gdp_pc))
+
+# Load world map for spatial joining
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+# ==============================================================================
+# 4. ITERATE THROUGH COMBINATIONS SEPARATELY
+# ==============================================================================
+for (comb_name in names(macro_combinations)) {
+  current_vars <- macro_combinations[[comb_name]]
+  
+  cat(sprintf("\n====================================================\n"))
+  cat(sprintf(" ESDA: GLOBAL MORAN'S I (%s)\n", comb_name))
+  cat(sprintf("====================================================\n"))
+  
+  # Scale features for the current combination
+  econ_scaled <- scale(country_summary[, current_vars, drop = FALSE])
+  
+  # Compute Euclidean distance matrix
+  econ_dist <- as.matrix(dist(econ_scaled, method = "euclidean"))
+  rownames(econ_dist) <- country_summary$company_location
+  colnames(econ_dist) <- country_summary$company_location
+  
+  # Create KNN weights matrix (k = 3)
+  knn_econ <- knearneigh(econ_dist, k = 3)
+  nb_econ <- knn2nb(knn_econ)
+  weights_matrix_econ <- nb2listw(nb_econ, style = "W")
+  
+  # Calculate Moran's I
+  moran_res <- moran.test(country_summary$mean_raw_salary, weights_matrix_econ)
+  print(moran_res)
+  
+  # Generate & Save Moran Scatter Plot
+  plot_filename_scatter <- paste0("moran_scatterplot_", comb_name, ".png")
+  png(plot_filename_scatter, width = 800, height = 800, res = 120)
+  moran.plot(country_summary$mean_raw_salary, weights_matrix_econ, 
+             xlab = "Standardized Raw Salary (Country)",
+             ylab = paste0("Economic Lag (", comb_name, ")"),
+             main = paste0("Moran Scatter Plot - ", comb_name))
+  dev.off()
+  cat(sprintf("Saved: %s\n", plot_filename_scatter))
+  
+  # Generate & Save Choropleth Map
+  spatial_salary <- world %>%
+    left_join(country_summary, by = c("admin" = "company_location")) %>%
+    filter(!is.na(mean_raw_salary))
+  
+  map_plot <- ggplot(spatial_salary) +
+    geom_sf(aes(fill = mean_raw_salary), color = "white", size = 0.2) +
+    scale_fill_viridis_c(option = "plasma", name = "Mean Raw Salary (USD)") +
+    theme_minimal() +
+    labs(
+      title = paste0("Global Distribution of AI Salaries (", comb_name, ")"),
+      subtitle = "Aggregated Mean Salary Across Mapped Countries",
+      caption = "Source: Study Dataset Economic ESDA Analysis"
+    ) +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      legend.position = "bottom"
+    )
+  
+  plot_filename_map <- paste0("global_salary_choropleth_", comb_name, ".png")
+  ggsave(plot_filename_map, plot = map_plot, width = 10, height = 6, dpi = 300)
+  cat(sprintf("Saved: %s\n\n", plot_filename_map))
+}
+```
+
+
+```{r Spatial Random Forest with Economic Distance (Enhance)}
+# ==============================================================================
+# ABLATION STUDY: SPATIAL RANDOM FOREST (RAW VS LOG) - NESTED CV ENHANCED
+# (Updated with Mahalanobis Distance, Fold-Isolated MEMs, Spatial Block CV, MEM Failsafe,
+#  and Country-Level Moran's I Evaluation)
+# ==============================================================================
+library(ranger)
+library(spatialRF)
+library(dplyr)
+library(ape)   # Required for Moran's I
+library(stats) # Required for cov()
+
+# 0. DEFINE ABLATION COMBINATIONS & PREPARE STORAGE
+macro_combinations <- list(
+  comb_1 = c("gdp_pc"),
+  comb_2 = c("gdp_pc", "cost_of_living"),
+  comb_3 = c("gdp_pc", "cost_of_living", "tech_index"),
+  comb_4 = c("gdp_pc", "cost_of_living", "tech_index", "human_capital_index")
+)
+
+ablation_results_srf <- data.frame(
+  Combination = character(), Model = character(), 
+  RMSE = numeric(), R_Squared = numeric(), 
+  Morans_I_Obs = numeric(), Morans_I_p = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Base predictors (Including Economic Arbitrage Features from Feedback #1)
+base_predictors <- c("years_experience", "remote_ratio", "benefits_score", 
+                     "company_size_num", "education_num", 
+                     "arbitrage_gdp_ratio", "arbitrage_col_ratio",
+                     colnames(industry_dummies))
+
+# ==============================================================================
+# DEFINE HYPERPARAMETER TUNING FUNCTION 
+# ==============================================================================
+tune_spatial_rf <- function(dependent_var, data, predictors_list) {
+  total_features <- length(predictors_list)
+  mtry_vals <- unique(floor(c(2, sqrt(total_features), total_features/3, total_features/2)))
+  
+  param_grid <- expand.grid(mtry = mtry_vals, min.node.size = c(3, 5, 10, 15))
+  best_mse <- Inf
+  best_params <- NULL
+  
+  for(i in 1:nrow(param_grid)) {
+    fit <- ranger(
+      dependent.variable.name = dependent_var,
+      data = data[, c(dependent_var, predictors_list)],
+      num.trees = 500,
+      mtry = param_grid$mtry[i],
+      min.node.size = param_grid$min.node.size[i],
+      seed = 123
+    )
+    if(fit$prediction.error < best_mse) {
+      best_mse <- fit$prediction.error
+      best_params <- param_grid[i, ]
+    }
+  }
+  return(best_params)
+}
+
+# ==============================================================================
+# SAFE MEM EXTRACTION FUNCTION (Handles "length 0" optimization crashes)
+# ==============================================================================
+safe_extract_mems <- function(train_country_summary, dep_var, agg_predictors, train_dist_matrix, adjusted_thresholds) {
+  result <- tryCatch({
+    model_econ <- rf_spatial(
+      data = train_country_summary,
+      dependent.variable.name = dep_var,
+      predictor.variable.names = agg_predictors,
+      distance.matrix = train_dist_matrix,
+      distance.thresholds = adjusted_thresholds, 
+      method = "mem.moran.sequential",     
+      n.cores = 3,  
+      seed = 123,
+      verbose = FALSE
+    )
+    
+    if (ncol(model_econ$spatial$spatial.predictors) == 0) stop("Zero MEMs selected")
+    return(model_econ$spatial$spatial.predictors)
+    
+  }, error = function(e) {
+    cat("    [Notice] Sequential MEM optimization failed or returned 0 MEMs. Falling back to global eigenvectors.\n")
+    inv_weights <- 1 / (train_dist_matrix + 1e-6)
+    diag(inv_weights) <- 0
+    n <- nrow(inv_weights)
+    centering_matrix <- diag(n) - matrix(1/n, n, n)
+    centered_weights <- centering_matrix %*% inv_weights %*% centering_matrix
+    eigen_decomp <- eigen(centered_weights, symmetric = TRUE)
+    positive_idx <- which(eigen_decomp$values > 1e-8)
+    if(length(positive_idx) > 5) positive_idx <- positive_idx[1:5]
+    fallback_mems <- data.frame(eigen_decomp$vectors[, positive_idx])
+    colnames(fallback_mems) <- paste0("spatial_predictor_", 1:ncol(fallback_mems))
+    return(fallback_mems)
+  })
+  return(result)
+}
+
+# ==============================================================================
+# START ABLATION LOOP
+# ==============================================================================
+for (comb_name in names(macro_combinations)) {
+  current_macro_vars <- macro_combinations[[comb_name]]
+  cat(sprintf("\n\n=== RUNNING ABLATION: %s (%d Variables) ===\n", comb_name, length(current_macro_vars)))
+  
+  # Ensure clean target columns per iteration
+  current_job_data <- job_data_econ %>% select(-starts_with("spatial_predictor_"))
+  current_job_data$log_salary_usd <- log(current_job_data$salary_usd)
+  current_job_data$pred_rf_spatial_raw <- NA
+  current_job_data$pred_rf_spatial_log <- NA
+  
+  # ==============================================================================
+  # SPATIAL BLOCK CV LOOP (LOCO)
+  # ==============================================================================
+  cat("Running Spatial Block 5-Fold CV (LOCO) with Fold-Isolated MEMs...\n")
+  
+  for(f in 1:5) {
+    train_idx <- which(current_job_data$fold != f)
+    test_idx  <- which(current_job_data$fold == f)
+    
+    cat("  -> Processing Fold", f, "(Train:", length(train_idx), "rows, Test:", length(test_idx), "rows)\n")
+    
+    train_data <- current_job_data[train_idx, ]
+    test_data  <- current_job_data[test_idx, ]
+    
+    # ------------------------------------------------------------------------------
+    # STEP 1: CALCULATE MAHALANOBIS DISTANCE ONLY ON TRAINING DATA 
+    # ------------------------------------------------------------------------------
+    train_country_summary <- train_data %>%
+      group_by(company_location) %>%
+      summarise(
+        salary_usd = mean(salary_usd, na.rm = TRUE),
+        log_salary_usd = mean(log_salary_usd, na.rm = TRUE),
+        years_experience = mean(years_experience, na.rm = TRUE),
+        remote_ratio = mean(remote_ratio, na.rm = TRUE),
+        benefits_score = mean(benefits_score, na.rm = TRUE),
+        company_size_num = mean(company_size_num, na.rm = TRUE),
+        education_num = mean(education_num, na.rm = TRUE)
+      ) %>%
+      ungroup()
+      
+    macro_summary <- econ_lookup %>% filter(company_location %in% train_country_summary$company_location)
+    train_country_summary <- train_country_summary %>% left_join(macro_summary[, c("company_location", current_macro_vars)], by = "company_location")
+    
+    macro_mat_train <- as.matrix(train_country_summary[, current_macro_vars, drop = FALSE])
+    cov_matrix_train <- cov(macro_mat_train)
+    if (length(current_macro_vars) == 1) cov_matrix_train <- matrix(cov_matrix_train, 1, 1)
+    diag(cov_matrix_train) <- diag(cov_matrix_train) + 1e-6 
+    inv_cov_matrix_train <- solve(cov_matrix_train)
+    
+    train_dist_matrix <- matrix(0, nrow = nrow(train_country_summary), ncol = nrow(train_country_summary))
+    for(i in 1:nrow(train_country_summary)) {
+      diff_matrix <- sweep(macro_mat_train, 2, as.numeric(macro_mat_train[i, ]), "-")
+      train_dist_matrix[i, ] <- sqrt(rowSums((diff_matrix %*% inv_cov_matrix_train) * diff_matrix))
+    }
+    rownames(train_dist_matrix) <- train_country_summary$company_location
+    colnames(train_dist_matrix) <- train_country_summary$company_location
+    
+    # ------------------------------------------------------------------------------
+    # STEP 2: EXTRACT FOLD-ISOLATED MEMS 
+    # ------------------------------------------------------------------------------
+    agg_predictors <- c("years_experience", "remote_ratio", "benefits_score", 
+                        "company_size_num", "education_num")
+    
+    min_dist <- min(train_dist_matrix[train_dist_matrix > 0])
+    max_dist <- max(train_dist_matrix)
+    adjusted_thresholds <- seq(from = min_dist, to = max_dist / 2, length.out = 5)
+    
+    # Safe Extract MEMs for Raw target
+    raw_mems <- safe_extract_mems(train_country_summary, "salary_usd", agg_predictors, train_dist_matrix, adjusted_thresholds)
+    spatial_features_train_raw <- data.frame(company_location = train_country_summary$company_location, raw_mems)
+    colnames(spatial_features_train_raw)[-1] <- paste0(colnames(spatial_features_train_raw)[-1], "_raw")
+    spatial_vars_raw <- colnames(spatial_features_train_raw)[-1]
+    
+    # Safe Extract MEMs for Log target
+    log_mems <- safe_extract_mems(train_country_summary, "log_salary_usd", agg_predictors, train_dist_matrix, adjusted_thresholds)
+    spatial_features_train_log <- data.frame(company_location = train_country_summary$company_location, log_mems)
+    colnames(spatial_features_train_log)[-1] <- paste0(colnames(spatial_features_train_log)[-1], "_log")
+    spatial_vars_log <- colnames(spatial_features_train_log)[-1]
+    
+    # ------------------------------------------------------------------------------
+    # STEP 3: PROJECT MEMS ONTO TEST DATA (Zero Data Leakage)
+    # ------------------------------------------------------------------------------
+    unique_test_countries <- unique(test_data$company_location)
+    spatial_features_test_raw <- data.frame(company_location = unique_test_countries)
+    spatial_features_test_log <- data.frame(company_location = unique_test_countries)
+    
+    for (sv in spatial_vars_raw) spatial_features_test_raw[[sv]] <- NA
+    for (sv in spatial_vars_log) spatial_features_test_log[[sv]] <- NA
+    
+    for (i in 1:length(unique_test_countries)) {
+      test_country <- unique_test_countries[i]
+      test_country_macro <- as.matrix(econ_lookup[econ_lookup$company_location == test_country, current_macro_vars, drop = FALSE])
+      
+      diff_matrix <- sweep(macro_mat_train, 2, as.numeric(test_country_macro), "-")
+      dist_to_train <- sqrt(rowSums((diff_matrix %*% inv_cov_matrix_train) * diff_matrix))
+      
+      inv_weights <- 1 / (dist_to_train + 1e-6)
+      normalized_weights <- inv_weights / sum(inv_weights)
+      
+      for (sv in spatial_vars_raw) {
+        spatial_features_test_raw[i, sv] <- sum(spatial_features_train_raw[[sv]] * normalized_weights)
+      }
+      for (sv in spatial_vars_log) {
+        spatial_features_test_log[i, sv] <- sum(spatial_features_train_log[[sv]] * normalized_weights)
+      }
+    }
+    
+    train_data <- train_data %>% 
+      left_join(spatial_features_train_raw, by = "company_location") %>%
+      left_join(spatial_features_train_log, by = "company_location")
+      
+    test_data <- test_data %>% 
+      left_join(spatial_features_test_raw, by = "company_location") %>%
+      left_join(spatial_features_test_log, by = "company_location")
+    
+    all_predictors_raw <- c(base_predictors, current_macro_vars, spatial_vars_raw)
+    all_predictors_log <- c(base_predictors, current_macro_vars, spatial_vars_log)
+    
+    # ------------------------------------------------------------------------------
+    # STEP 4: TUNE & TRAIN EXCLUSIVELY ON THE TRAINING FOLD
+    # ------------------------------------------------------------------------------
+    best_params_raw <- tune_spatial_rf("salary_usd", train_data, all_predictors_raw)
+    best_params_log <- tune_spatial_rf("log_salary_usd", train_data, all_predictors_log)
+    
+    model_cv_raw <- ranger(
+      dependent.variable.name = "salary_usd",
+      data = train_data[, c("salary_usd", all_predictors_raw)],
+      num.trees = 500, mtry = best_params_raw$mtry, min.node.size = best_params_raw$min.node.size, seed = 123
+    )
+    
+    model_cv_log <- ranger(
+      dependent.variable.name = "log_salary_usd",
+      data = train_data[, c("log_salary_usd", all_predictors_log)],
+      num.trees = 500, mtry = best_params_log$mtry, min.node.size = best_params_log$min.node.size, seed = 123
+    )
+    
+    current_job_data$pred_rf_spatial_raw[test_idx] <- predict(model_cv_raw, data = test_data)$predictions
+    current_job_data$pred_rf_spatial_log[test_idx] <- exp(predict(model_cv_log, data = test_data)$predictions)
+  }
+  
+  # ==============================================================================
+  # EVALUATION: AGGREGATE TO COUNTRY LEVEL FOR MORAN'S I 
+  # ==============================================================================
+  cat("Evaluating Metrics and Residual Autocorrelation...\n")
+  
+  # 1. Calculate overall RMSE and R-Squared at the individual row level
+  resids_raw <- current_job_data$salary_usd - current_job_data$pred_rf_spatial_raw
+  resids_log <- current_job_data$salary_usd - current_job_data$pred_rf_spatial_log
+  
+  r2_raw <- 1 - (sum(resids_raw^2) / sum((current_job_data$salary_usd - mean(current_job_data$salary_usd))^2))
+  r2_log <- 1 - (sum(resids_log^2) / sum((current_job_data$salary_usd - mean(current_job_data$salary_usd))^2))
+  
+  rmse_raw <- sqrt(mean(resids_raw^2))
+  rmse_log <- sqrt(mean(resids_log^2))
+  
+  # 2. Aggregate residuals to the country level for valid Spatial Autocorrelation testing
+  country_eval <- current_job_data %>%
+    group_by(company_location) %>%
+    summarise(
+      mean_resid_raw = mean(salary_usd - pred_rf_spatial_raw, na.rm = TRUE),
+      mean_resid_log = mean(salary_usd - pred_rf_spatial_log, na.rm = TRUE)
+    ) %>%
+    ungroup()
+    
+  macro_eval <- econ_lookup %>% filter(company_location %in% country_eval$company_location)
+  country_eval <- country_eval %>% left_join(macro_eval[, c("company_location", current_macro_vars)], by = "company_location")
+  
+  # 3. Build a Country-Level Mahalanobis Weight Matrix
+  macro_mat_eval <- as.matrix(country_eval[, current_macro_vars, drop = FALSE])
+  cov_matrix_eval <- cov(macro_mat_eval)
+  if (length(current_macro_vars) == 1) cov_matrix_eval <- matrix(cov_matrix_eval, 1, 1)
+  diag(cov_matrix_eval) <- diag(cov_matrix_eval) + 1e-6 
+  inv_cov_matrix_eval <- solve(cov_matrix_eval)
+  
+  country_dist_matrix <- matrix(0, nrow = nrow(country_eval), ncol = nrow(country_eval))
+  for(i in 1:nrow(country_eval)) {
+    diff_matrix <- sweep(macro_mat_eval, 2, as.numeric(macro_mat_eval[i, ]), "-")
+    country_dist_matrix[i, ] <- sqrt(rowSums((diff_matrix %*% inv_cov_matrix_eval) * diff_matrix))
+  }
+  
+  inv_dist_weights_eval <- 1 / (country_dist_matrix + 1e-6)
+  diag(inv_dist_weights_eval) <- 0
+  
+  # 4. Calculate Moran's I on the Country-Averaged Residuals
+  moran_raw <- Moran.I(country_eval$mean_resid_raw, inv_dist_weights_eval)
+  moran_log <- Moran.I(country_eval$mean_resid_log, inv_dist_weights_eval)
+  
+  ablation_results_srf <- rbind(
+    ablation_results_srf,
+    data.frame(Combination = comb_name, Model = "Spatial RF (Raw)", RMSE = rmse_raw, R_Squared = r2_raw, 
+               Morans_I_Obs = moran_raw$observed, Morans_I_p = moran_raw$p.value),
+    data.frame(Combination = comb_name, Model = "Spatial RF (Log)", RMSE = rmse_log, R_Squared = r2_log, 
+               Morans_I_Obs = moran_log$observed, Morans_I_p = moran_log$p.value)
+  )
+}
+
+print(ablation_results_srf)
+```
+
+
+```{r Normal Random Forest}
+# ==============================================================================
+# ABLATION STUDY: NORMAL RANDOM FOREST (RAW VS LOG) - NESTED CV ENHANCED
+# (Updated with Spatial Block CV & Country-Level Moran's I Evaluation)
+# ==============================================================================
+library(ranger)
+library(dplyr)
+library(ape)   # Required for Moran's I
+library(stats) # Required for cov()
+
+# 0. DEFINE ABLATION COMBINATIONS & PREPARE STORAGE
+macro_combinations <- list(
+  comb_1 = c("gdp_pc"),
+  comb_2 = c("gdp_pc", "cost_of_living"),
+  comb_3 = c("gdp_pc", "cost_of_living", "tech_index"),
+  comb_4 = c("gdp_pc", "cost_of_living", "tech_index", "human_capital_index")
+)
+
+ablation_results_nrf <- data.frame(
+  Combination = character(), Model = character(), 
+  RMSE = numeric(), R_Squared = numeric(), 
+  Morans_I_Obs = numeric(), Morans_I_p = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Base predictors (Including Economic Arbitrage from Feedback #1)
+base_features_str <- paste(
+  "years_experience", "remote_ratio", "company_size_num", 
+  "education_num", "benefits_score", "arbitrage_gdp_ratio", "arbitrage_col_ratio",
+  paste(colnames(industry_dummies), collapse = " + "), 
+  sep = " + "
+)
+
+# ==============================================================================
+# START NORMAL RF ABLATION LOOP
+# ==============================================================================
+for (comb_name in names(macro_combinations)) {
+  current_macro_vars <- macro_combinations[[comb_name]]
+  cat(sprintf("\n\n=== RUNNING NORMAL RF ABLATION: %s (%d Variables) ===\n", comb_name, length(current_macro_vars)))
+  
+  current_job_data <- job_data_econ
+  current_job_data$log_salary_usd <- log(current_job_data$salary_usd)
+  current_job_data$pred_rf_normal_raw <- NA
+  current_job_data$pred_rf_normal_log <- NA
+  
+  # --- A. DYNAMICALLY CONSTRUCT FORMULAS ---
+  macro_features_str <- paste(current_macro_vars, collapse = " + ")
+  full_features_str <- paste(base_features_str, "+", macro_features_str)
+  
+  rf_formula_raw <- as.formula(paste("salary_usd ~", full_features_str))
+  rf_formula_log <- as.formula(paste("log_salary_usd ~", full_features_str))
+
+  # --- B. DEFINE TUNING GRID & FUNCTION ---
+  total_features <- 7 + length(colnames(industry_dummies)) + length(current_macro_vars)
+  mtry_vals <- unique(floor(c(2, sqrt(total_features), total_features/3, total_features/2)))
+  param_grid <- expand.grid(mtry = mtry_vals, min.node.size = c(3, 5, 10, 15))
+  
+  tune_rf <- function(formula, data) {
+    best_mse <- Inf
+    best_params <- NULL
+    for(i in 1:nrow(param_grid)) {
+      fit <- ranger(formula = formula, data = data, num.trees = 500,
+                    mtry = param_grid$mtry[i], min.node.size = param_grid$min.node.size[i], seed = 123)
+      if(fit$prediction.error < best_mse) {
+        best_mse <- fit$prediction.error
+        best_params <- param_grid[i, ]
+      }
+    }
+    return(best_params)
+  }
+  
+  # --- C. TRAIN MODELS VIA NESTED 5-FOLD SPATIAL BLOCK CV (LOCO) ---
+  cat("Running Nested 5-Fold CV (LOCO)...\n")
+  for(f in 1:5) {
+    train_idx <- which(current_job_data$fold != f)
+    test_idx  <- which(current_job_data$fold == f)
+    
+    cat("  -> Tuning & Training Fold", f, "...\n")
+    train_data <- current_job_data[train_idx, ]
+    
+    # 1. TUNE EXCLUSIVELY ON THE TRAINING FOLD
+    best_params_raw <- tune_rf(rf_formula_raw, train_data)
+    best_params_log <- tune_rf(rf_formula_log, train_data)
+    
+    # 2. TRAIN RAW MODEL WITH TUNED PARAMS
+    model_normal_raw_fold <- ranger(
+      formula = rf_formula_raw, data = train_data, num.trees = 500,
+      mtry = best_params_raw$mtry, min.node.size = best_params_raw$min.node.size, seed = 123
+    )
+    current_job_data$pred_rf_normal_raw[test_idx] <- predict(model_normal_raw_fold, data = current_job_data[test_idx, ])$predictions
+    
+    # 3. TRAIN LOG MODEL WITH TUNED PARAMS
+    model_normal_log_fold <- ranger(
+      formula = rf_formula_log, data = train_data, num.trees = 500,
+      mtry = best_params_log$mtry, min.node.size = best_params_log$min.node.size, seed = 123
+    )
+    current_job_data$pred_rf_normal_log[test_idx] <- exp(predict(model_normal_log_fold, data = current_job_data[test_idx, ])$predictions)
+  }
+  
+  # --- D. EVALUATION: AGGREGATE TO COUNTRY LEVEL FOR MORAN'S I ---
+  cat("Evaluating Metrics and Residual Autocorrelation...\n")
+  
+  # 1. Calculate overall RMSE and R-Squared at the individual row level
+  resids_raw <- current_job_data$salary_usd - current_job_data$pred_rf_normal_raw
+  resids_log <- current_job_data$salary_usd - current_job_data$pred_rf_normal_log
+  
+  r2_raw <- 1 - (sum(resids_raw^2) / sum((current_job_data$salary_usd - mean(current_job_data$salary_usd))^2))
+  r2_log <- 1 - (sum(resids_log^2) / sum((current_job_data$salary_usd - mean(current_job_data$salary_usd))^2))
+  
+  rmse_raw <- sqrt(mean(resids_raw^2))
+  rmse_log <- sqrt(mean(resids_log^2))
+  
+  # 2. Aggregate residuals to the country level for valid Spatial Autocorrelation testing
+  country_eval <- current_job_data %>%
+    group_by(company_location) %>%
+    summarise(
+      mean_resid_raw = mean(salary_usd - pred_rf_normal_raw, na.rm = TRUE),
+      mean_resid_log = mean(salary_usd - pred_rf_normal_log, na.rm = TRUE)
+    ) %>%
+    ungroup()
+    
+  macro_eval <- econ_lookup %>% filter(company_location %in% country_eval$company_location)
+  country_eval <- country_eval %>% left_join(macro_eval[, c("company_location", current_macro_vars)], by = "company_location")
+  
+  # 3. Build a Country-Level Mahalanobis Weight Matrix
+  macro_mat_eval <- as.matrix(country_eval[, current_macro_vars, drop = FALSE])
+  cov_matrix_eval <- cov(macro_mat_eval)
+  if (length(current_macro_vars) == 1) cov_matrix_eval <- matrix(cov_matrix_eval, 1, 1)
+  diag(cov_matrix_eval) <- diag(cov_matrix_eval) + 1e-6 
+  inv_cov_matrix_eval <- solve(cov_matrix_eval)
+  
+  country_dist_matrix <- matrix(0, nrow = nrow(country_eval), ncol = nrow(country_eval))
+  for(i in 1:nrow(country_eval)) {
+    diff_matrix <- sweep(macro_mat_eval, 2, as.numeric(macro_mat_eval[i, ]), "-")
+    country_dist_matrix[i, ] <- sqrt(rowSums((diff_matrix %*% inv_cov_matrix_eval) * diff_matrix))
+  }
+  
+  inv_dist_weights_eval <- 1 / (country_dist_matrix + 1e-6)
+  diag(inv_dist_weights_eval) <- 0
+  
+  # 4. Calculate Moran's I on the Country-Averaged Residuals
+  moran_raw <- Moran.I(country_eval$mean_resid_raw, inv_dist_weights_eval)
+  moran_log <- Moran.I(country_eval$mean_resid_log, inv_dist_weights_eval)
+  
+  ablation_results_nrf <- rbind(
+    ablation_results_nrf,
+    data.frame(Combination = comb_name, Model = "Normal RF (Raw)", RMSE = rmse_raw, R_Squared = r2_raw, 
+               Morans_I_Obs = moran_raw$observed, Morans_I_p = moran_raw$p.value),
+    data.frame(Combination = comb_name, Model = "Normal RF (Log)", RMSE = rmse_log, R_Squared = r2_log, 
+               Morans_I_Obs = moran_log$observed, Morans_I_p = moran_log$p.value)
+  )
+}
+
+print(ablation_results_nrf)
+```
+
+
+```{r MEM XGBoost}
+# ==============================================================================
+# ABLATION STUDY: SPATIAL XGBOOST (RAW VS LOG) - NESTED CV ENHANCED
+# (Updated with Spatial Block CV, Mahalanobis MEM Projection, Failsafe, 
+#  & Country-Level Moran's I Evaluation)
+# ==============================================================================
+library(xgboost)
+library(dplyr)
+library(spatialRF)
+library(ape)   # Added ape for consistent Moran's I evaluation
+library(stats) # Required for cov()
+
+# 0. DEFINE ABLATION COMBINATIONS & STORAGE
+macro_combinations <- list(
+  comb_1 = c("gdp_pc"),
+  comb_2 = c("gdp_pc", "cost_of_living"),
+  comb_3 = c("gdp_pc", "cost_of_living", "tech_index"),
+  comb_4 = c("gdp_pc", "cost_of_living", "tech_index", "human_capital_index")
+)
+
+ablation_results_sxgb <- data.frame(
+  Combination = character(), Model = character(), 
+  RMSE = numeric(), R_Squared = numeric(), 
+  Morans_I_Obs = numeric(), Morans_I_p = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Base predictors (Including Economic Arbitrage from Feedback #1)
+industry_cols <- colnames(industry_dummies)
+base_features <- c("years_experience", "remote_ratio", "company_size_num", 
+                   "education_num", "benefits_score", 
+                   "arbitrage_gdp_ratio", "arbitrage_col_ratio", industry_cols)
+
+# ==============================================================================
+# SAFE MEM EXTRACTION FUNCTION
+# ==============================================================================
+safe_extract_mems <- function(train_country_summary, dep_var, agg_predictors, train_dist_matrix, adjusted_thresholds) {
+  result <- tryCatch({
+    model_econ <- rf_spatial(
+      data = train_country_summary, dependent.variable.name = dep_var, predictor.variable.names = agg_predictors,
+      distance.matrix = train_dist_matrix, distance.thresholds = adjusted_thresholds, 
+      method = "mem.moran.sequential", n.cores = 3, seed = 123, verbose = FALSE
+    )
+    if (ncol(model_econ$spatial$spatial.predictors) == 0) stop("Zero MEMs selected")
+    return(model_econ$spatial$spatial.predictors)
+  }, error = function(e) {
+    cat("    [Notice] Sequential MEM optimization failed or returned 0 MEMs. Falling back to global eigenvectors.\n")
+    inv_weights <- 1 / (train_dist_matrix + 1e-6)
+    diag(inv_weights) <- 0
+    n <- nrow(inv_weights)
+    centering_matrix <- diag(n) - matrix(1/n, n, n)
+    centered_weights <- centering_matrix %*% inv_weights %*% centering_matrix
+    eigen_decomp <- eigen(centered_weights, symmetric = TRUE)
+    positive_idx <- which(eigen_decomp$values > 1e-8)
+    if(length(positive_idx) > 5) positive_idx <- positive_idx[1:5]
+    fallback_mems <- data.frame(eigen_decomp$vectors[, positive_idx])
+    colnames(fallback_mems) <- paste0("spatial_predictor_", 1:ncol(fallback_mems))
+    return(fallback_mems)
+  })
+  return(result)
+}
+
+# ==============================================================================
+# DEFINE HYPERPARAMETER TUNING FUNCTION (STRATIFIED INNER 3-FOLD)
+# ==============================================================================
+tune_xgb <- function(X, y, train_locations) {
+  dtrain <- xgb.DMatrix(data = X, label = y)
+  best_rmse <- Inf
+  best_params <- NULL
+  best_nrounds <- 100 
+  
+  set.seed(123) 
+  inner_fold_assign <- data.frame(location = train_locations, row_id = 1:nrow(X)) %>%
+    group_by(location) %>%
+    mutate(inner_fold = sample(rep(1:3, length.out = n()))) %>%
+    ungroup()
+  
+  custom_cv_folds <- list(
+    Fold1 = which(inner_fold_assign$inner_fold == 1),
+    Fold2 = which(inner_fold_assign$inner_fold == 2),
+    Fold3 = which(inner_fold_assign$inner_fold == 3)
+  )
+  
+  param_grid <- expand.grid(max_depth = c(3, 5, 7), eta = c(0.01, 0.05, 0.1), min_child_weight = c(1, 3, 5))
+  
+  for(i in 1:nrow(param_grid)) {
+    params <- list(objective = "reg:squarederror", max_depth = param_grid$max_depth[i],
+                   eta = param_grid$eta[i], min_child_weight = param_grid$min_child_weight[i],
+                   subsample = 0.8, colsample_bytree = 0.8, seed = 123)
+    
+    cv_res <- xgb.cv(params = params, data = dtrain, nrounds = 1000, folds = custom_cv_folds,
+                     early_stopping_rounds = 20, metrics = "rmse", verbose = 0)
+    
+    current_rmse <- min(cv_res$evaluation_log$test_rmse_mean)
+    opt_nrounds <- if(!is.null(cv_res$best_iteration) && length(cv_res$best_iteration) > 0 && cv_res$best_iteration > 0) {
+      cv_res$best_iteration
+    } else {
+      which.min(cv_res$evaluation_log$test_rmse_mean)
+    }
+    
+    if(current_rmse < best_rmse) {
+      best_rmse <- current_rmse
+      best_params <- params
+      best_nrounds <- opt_nrounds
+    }
+  }
+  best_params$nrounds <- as.integer(best_nrounds)
+  return(best_params)
+}
+
+# ==============================================================================
+# START SPATIAL XGBOOST ABLATION LOOP
+# ==============================================================================
+for (comb_name in names(macro_combinations)) {
+  current_macro_vars <- macro_combinations[[comb_name]]
+  cat(sprintf("\n\n=== RUNNING SPATIAL XGBOOST ABLATION: %s (%d Variables) ===\n", comb_name, length(current_macro_vars)))
+  
+  current_job_data <- as.data.frame(job_data_econ) %>% select(-starts_with("spatial_predictor_"))
+  current_job_data$log_salary_usd <- log(current_job_data$salary_usd)
+  current_job_data$pred_xgb_spatial_raw <- NA
+  current_job_data$pred_xgb_spatial_log <- NA
+  
+  # ==============================================================================
+  # TRAIN MODELS VIA SPATIAL BLOCK CV (LOCO) & FOLD-ISOLATED MEMS
+  # ==============================================================================
+  cat("Running Spatial Block 5-Fold CV (LOCO)...\n")
+  for(f in 1:5) {
+    train_idx <- which(current_job_data$fold != f)
+    test_idx  <- which(current_job_data$fold == f)
+    
+    cat("  -> Processing Fold", f, "(Train:", length(train_idx), "rows, Test:", length(test_idx), "rows)\n")
+    train_data <- current_job_data[train_idx, ]
+    test_data  <- current_job_data[test_idx, ]
+    
+    # ------------------------------------------------------------------------------
+    # 1. CALCULATE MAHALANOBIS DISTANCE ONLY ON TRAINING DATA
+    # ------------------------------------------------------------------------------
+    train_country_summary <- train_data %>%
+      group_by(company_location) %>%
+      summarise(
+        salary_usd = mean(salary_usd, na.rm = TRUE),
+        log_salary_usd = mean(log_salary_usd, na.rm = TRUE),
+        years_experience = mean(years_experience, na.rm = TRUE),
+        remote_ratio = mean(remote_ratio, na.rm = TRUE),
+        benefits_score = mean(benefits_score, na.rm = TRUE),
+        company_size_num = mean(company_size_num, na.rm = TRUE),
+        education_num = mean(education_num, na.rm = TRUE)
+      ) %>%
+      ungroup()
+      
+    macro_summary <- econ_lookup %>% filter(company_location %in% train_country_summary$company_location)
+    train_country_summary <- train_country_summary %>% left_join(macro_summary[, c("company_location", current_macro_vars)], by = "company_location")
+    
+    macro_mat_train <- as.matrix(train_country_summary[, current_macro_vars, drop = FALSE])
+    cov_matrix_train <- cov(macro_mat_train)
+    if (length(current_macro_vars) == 1) cov_matrix_train <- matrix(cov_matrix_train, 1, 1)
+    diag(cov_matrix_train) <- diag(cov_matrix_train) + 1e-6 
+    inv_cov_matrix_train <- solve(cov_matrix_train)
+    
+    train_dist_matrix <- matrix(0, nrow = nrow(train_country_summary), ncol = nrow(train_country_summary))
+    for(i in 1:nrow(train_country_summary)) {
+      diff_matrix <- sweep(macro_mat_train, 2, as.numeric(macro_mat_train[i, ]), "-")
+      train_dist_matrix[i, ] <- sqrt(rowSums((diff_matrix %*% inv_cov_matrix_train) * diff_matrix))
+    }
+    rownames(train_dist_matrix) <- train_country_summary$company_location
+    colnames(train_dist_matrix) <- train_country_summary$company_location
+    
+    # ------------------------------------------------------------------------------
+    # 2. EXTRACT FOLD-ISOLATED MEMS
+    # ------------------------------------------------------------------------------
+    agg_predictors <- c("years_experience", "remote_ratio", "benefits_score", "company_size_num", "education_num")
+    min_dist <- min(train_dist_matrix[train_dist_matrix > 0])
+    max_dist <- max(train_dist_matrix)
+    adjusted_thresholds <- seq(from = min_dist, to = max_dist / 2, length.out = 5)
+    
+    raw_mems <- safe_extract_mems(train_country_summary, "salary_usd", agg_predictors, train_dist_matrix, adjusted_thresholds)
+    spatial_features_train_raw <- data.frame(company_location = train_country_summary$company_location, raw_mems)
+    colnames(spatial_features_train_raw)[-1] <- paste0(colnames(spatial_features_train_raw)[-1], "_raw")
+    spatial_vars_raw <- colnames(spatial_features_train_raw)[-1]
+    
+    log_mems <- safe_extract_mems(train_country_summary, "log_salary_usd", agg_predictors, train_dist_matrix, adjusted_thresholds)
+    spatial_features_train_log <- data.frame(company_location = train_country_summary$company_location, log_mems)
+    colnames(spatial_features_train_log)[-1] <- paste0(colnames(spatial_features_train_log)[-1], "_log")
+    spatial_vars_log <- colnames(spatial_features_train_log)[-1]
+    
+    # ------------------------------------------------------------------------------
+    # 3. PROJECT MEMS ONTO TEST DATA (Zero Data Leakage)
+    # ------------------------------------------------------------------------------
+    unique_test_countries <- unique(test_data$company_location)
+    spatial_features_test_raw <- data.frame(company_location = unique_test_countries)
+    spatial_features_test_log <- data.frame(company_location = unique_test_countries)
+    
+    for (sv in spatial_vars_raw) spatial_features_test_raw[[sv]] <- NA
+    for (sv in spatial_vars_log) spatial_features_test_log[[sv]] <- NA
+    
+    for (i in 1:length(unique_test_countries)) {
+      test_country <- unique_test_countries[i]
+      test_country_macro <- as.matrix(econ_lookup[econ_lookup$company_location == test_country, current_macro_vars, drop = FALSE])
+      
+      diff_matrix <- sweep(macro_mat_train, 2, as.numeric(test_country_macro), "-")
+      dist_to_train <- sqrt(rowSums((diff_matrix %*% inv_cov_matrix_train) * diff_matrix))
+      
+      inv_weights <- 1 / (dist_to_train + 1e-6)
+      normalized_weights <- inv_weights / sum(inv_weights)
+      
+      for (sv in spatial_vars_raw) {
+        spatial_features_test_raw[i, sv] <- sum(spatial_features_train_raw[[sv]] * normalized_weights)
+      }
+      for (sv in spatial_vars_log) {
+        spatial_features_test_log[i, sv] <- sum(spatial_features_train_log[[sv]] * normalized_weights)
+      }
+    }
+    
+    train_data <- train_data %>% left_join(spatial_features_train_raw, by = "company_location") %>% left_join(spatial_features_train_log, by = "company_location")
+    test_data <- test_data %>% left_join(spatial_features_test_raw, by = "company_location") %>% left_join(spatial_features_test_log, by = "company_location")
+    
+    # ------------------------------------------------------------------------------
+    # 4. XGBOOST MATRIX SETUP & TRAINING
+    # ------------------------------------------------------------------------------
+    features_spatial_raw <- c(base_features, current_macro_vars, spatial_vars_raw)
+    features_spatial_log <- c(base_features, current_macro_vars, spatial_vars_log)
+    
+    X_train_raw <- as.matrix(train_data[, features_spatial_raw])
+    X_test_raw  <- as.matrix(test_data[, features_spatial_raw])
+    y_train_raw <- train_data$salary_usd
+    
+    X_train_log <- as.matrix(train_data[, features_spatial_log])
+    X_test_log  <- as.matrix(test_data[, features_spatial_log])
+    y_train_log <- train_data$log_salary_usd
+    
+    train_locations <- train_data$company_location
+    
+    best_params_raw <- tune_xgb(X_train_raw, y_train_raw, train_locations)
+    best_params_log <- tune_xgb(X_train_log, y_train_log, train_locations)
+    
+    dtrain_raw <- xgb.DMatrix(data = X_train_raw, label = y_train_raw)
+    dtest_raw  <- xgb.DMatrix(data = X_test_raw)
+    model_xgb_spatial_raw_fold <- xgb.train(params = best_params_raw[names(best_params_raw) != "nrounds"], data = dtrain_raw, nrounds = best_params_raw$nrounds)
+    current_job_data$pred_xgb_spatial_raw[test_idx] <- predict(model_xgb_spatial_raw_fold, dtest_raw)
+    
+    dtrain_log <- xgb.DMatrix(data = X_train_log, label = y_train_log)
+    dtest_log  <- xgb.DMatrix(data = X_test_log)
+    model_xgb_spatial_log_fold <- xgb.train(params = best_params_log[names(best_params_log) != "nrounds"], data = dtrain_log, nrounds = best_params_log$nrounds)
+    current_job_data$pred_xgb_spatial_log[test_idx] <- exp(predict(model_xgb_spatial_log_fold, dtest_log))
+  }
+  
+  # ==============================================================================
+  # 5. EVALUATION: AGGREGATE TO COUNTRY LEVEL FOR MORAN'S I 
+  # ==============================================================================
+  cat("Evaluating Metrics and Residual Autocorrelation...\n")
+  
+  # 1. Calculate overall RMSE and R-Squared at the individual row level
+  resids_raw <- current_job_data$salary_usd - current_job_data$pred_xgb_spatial_raw
+  resids_log <- current_job_data$salary_usd - current_job_data$pred_xgb_spatial_log
+  
+  r2_raw <- 1 - (sum(resids_raw^2) / sum((current_job_data$salary_usd - mean(current_job_data$salary_usd))^2))
+  r2_log <- 1 - (sum(resids_log^2) / sum((current_job_data$salary_usd - mean(current_job_data$salary_usd))^2))
+  
+  rmse_raw <- sqrt(mean(resids_raw^2))
+  rmse_log <- sqrt(mean(resids_log^2))
+  
+  # 2. Aggregate residuals to the country level for valid Spatial Autocorrelation testing
+  country_eval <- current_job_data %>%
+    group_by(company_location) %>%
+    summarise(
+      mean_resid_raw = mean(salary_usd - pred_xgb_spatial_raw, na.rm = TRUE),
+      mean_resid_log = mean(salary_usd - pred_xgb_spatial_log, na.rm = TRUE)
+    ) %>%
+    ungroup()
+    
+  macro_eval <- econ_lookup %>% filter(company_location %in% country_eval$company_location)
+  country_eval <- country_eval %>% left_join(macro_eval[, c("company_location", current_macro_vars)], by = "company_location")
+  
+  # 3. Build a Country-Level Mahalanobis Weight Matrix
+  macro_mat_eval <- as.matrix(country_eval[, current_macro_vars, drop = FALSE])
+  cov_matrix_eval <- cov(macro_mat_eval)
+  if (length(current_macro_vars) == 1) cov_matrix_eval <- matrix(cov_matrix_eval, 1, 1)
+  diag(cov_matrix_eval) <- diag(cov_matrix_eval) + 1e-6 
+  inv_cov_matrix_eval <- solve(cov_matrix_eval)
+  
+  country_dist_matrix <- matrix(0, nrow = nrow(country_eval), ncol = nrow(country_eval))
+  for(i in 1:nrow(country_eval)) {
+    diff_matrix <- sweep(macro_mat_eval, 2, as.numeric(macro_mat_eval[i, ]), "-")
+    country_dist_matrix[i, ] <- sqrt(rowSums((diff_matrix %*% inv_cov_matrix_eval) * diff_matrix))
+  }
+  
+  inv_dist_weights_eval <- 1 / (country_dist_matrix + 1e-6)
+  diag(inv_dist_weights_eval) <- 0
+  
+  # 4. Calculate Moran's I on the Country-Averaged Residuals
+  moran_raw <- Moran.I(country_eval$mean_resid_raw, inv_dist_weights_eval)
+  moran_log <- Moran.I(country_eval$mean_resid_log, inv_dist_weights_eval)
+  
+  ablation_results_sxgb <- rbind(
+    ablation_results_sxgb,
+    data.frame(Combination = comb_name, Model = "Spatial XGBoost (Raw)", RMSE = rmse_raw, R_Squared = r2_raw, 
+               Morans_I_Obs = moran_raw$observed, Morans_I_p = moran_raw$p.value),
+    data.frame(Combination = comb_name, Model = "Spatial XGBoost (Log)", RMSE = rmse_log, R_Squared = r2_log, 
+               Morans_I_Obs = moran_log$observed, Morans_I_p = moran_log$p.value)
+  )
+}
+
+print(ablation_results_sxgb)
+```
+
+
+
+```{r normal XGBoost}
+# ==============================================================================
+# ABLATION STUDY: NORMAL XGBOOST (RAW VS LOG) - NESTED CV ENHANCED
+# (Updated with Spatial Block CV & Country-Level Moran's I Evaluation)
+# ==============================================================================
+library(xgboost)
+library(dplyr)
+library(ape)   # Using ape for consistent Moran's I evaluation
+library(stats) # Required for cov()
+
+# 0. DEFINE ABLATION COMBINATIONS & STORAGE
+macro_combinations <- list(
+  comb_1 = c("gdp_pc"),
+  comb_2 = c("gdp_pc", "cost_of_living"),
+  comb_3 = c("gdp_pc", "cost_of_living", "tech_index"),
+  comb_4 = c("gdp_pc", "cost_of_living", "tech_index", "human_capital_index")
+)
+
+ablation_results_nxgb <- data.frame(
+  Combination = character(), Model = character(), 
+  RMSE = numeric(), R_Squared = numeric(), 
+  Morans_I_Obs = numeric(), Morans_I_p = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Base predictors (Including Economic Arbitrage from Feedback #1)
+industry_cols <- colnames(industry_dummies)
+base_features <- c("years_experience", "remote_ratio", "company_size_num", 
+                   "education_num", "benefits_score", 
+                   "arbitrage_gdp_ratio", "arbitrage_col_ratio", industry_cols)
+
+# ==============================================================================
+# DEFINE TUNING FUNCTION (STRATIFIED INNER 3-FOLD)
+# ==============================================================================
+tune_xgb <- function(X, y, train_locations) {
+  dtrain <- xgb.DMatrix(data = X, label = y)
+  best_rmse <- Inf
+  best_params <- NULL
+  best_nrounds <- 100 
+  
+  # CREATE INNER STRATIFIED 3-FOLDS
+  # Group by country to ensure proportional representation in the inner validation
+  set.seed(123) 
+  inner_fold_assign <- data.frame(location = train_locations, row_id = 1:nrow(X)) %>%
+    group_by(location) %>%
+    mutate(inner_fold = sample(rep(1:3, length.out = n()))) %>%
+    ungroup()
+  
+  # xgb.cv expects a list where each element contains the TEST row indices for that fold
+  custom_cv_folds <- list(
+    Fold1 = which(inner_fold_assign$inner_fold == 1),
+    Fold2 = which(inner_fold_assign$inner_fold == 2),
+    Fold3 = which(inner_fold_assign$inner_fold == 3)
+  )
+  
+  param_grid <- expand.grid(
+    max_depth = c(3, 5, 7),
+    eta = c(0.01, 0.05, 0.1),
+    min_child_weight = c(1, 3, 5)
+  )
+  
+  for(i in 1:nrow(param_grid)) {
+    params <- list(
+      objective = "reg:squarederror", max_depth = param_grid$max_depth[i],
+      eta = param_grid$eta[i], min_child_weight = param_grid$min_child_weight[i],
+      subsample = 0.8, colsample_bytree = 0.8, seed = 123
+    )
+    
+    cv_res <- xgb.cv(params = params, data = dtrain, nrounds = 1000, folds = custom_cv_folds,
+                     early_stopping_rounds = 20, metrics = "rmse", verbose = 0)
+    
+    current_rmse <- min(cv_res$evaluation_log$test_rmse_mean)
+    opt_nrounds <- if(!is.null(cv_res$best_iteration) && length(cv_res$best_iteration) > 0 && cv_res$best_iteration > 0) {
+      cv_res$best_iteration
+    } else {
+      which.min(cv_res$evaluation_log$test_rmse_mean)
+    }
+    
+    if(current_rmse < best_rmse) {
+      best_rmse <- current_rmse
+      best_params <- params
+      best_nrounds <- opt_nrounds
+    }
+  }
+  best_params$nrounds <- as.integer(best_nrounds)
+  return(best_params)
+}
+
+# ==============================================================================
+# START NORMAL XGBOOST ABLATION LOOP
+# ==============================================================================
+for (comb_name in names(macro_combinations)) {
+  current_macro_vars <- macro_combinations[[comb_name]]
+  cat(sprintf("\n\n=== RUNNING NORMAL XGBOOST ABLATION: %s (%d Variables) ===\n", comb_name, length(current_macro_vars)))
+  
+  # Ensure clean target columns per iteration
+  current_job_data <- as.data.frame(job_data_econ)
+  current_job_data$log_salary_usd <- log(current_job_data$salary_usd)
+  current_job_data$pred_xgb_normal_raw <- NA
+  current_job_data$pred_xgb_normal_log <- NA
+  
+  # --- A. DYNAMIC FEATURE MATRIX CONSTRUCTION ---
+  current_features <- c(base_features, current_macro_vars)
+  X_data <- as.matrix(current_job_data[, current_features])
+  y_raw <- current_job_data$salary_usd
+  y_log <- current_job_data$log_salary_usd
+  
+  # ==============================================================================
+  # B. TRAIN MODELS VIA NESTED 5-FOLD SPATIAL BLOCK CV (LOCO)
+  # ==============================================================================
+  cat("Running Nested 5-Fold CV (LOCO)...\n")
+  for(f in 1:5) {
+    train_idx <- which(current_job_data$fold != f)
+    test_idx  <- which(current_job_data$fold == f)
+    
+    cat("  -> Tuning & Training Fold", f, "...\n")
+    
+    train_locations <- current_job_data$company_location[train_idx]
+    
+    # 1. TUNE EXCLUSIVELY ON THE TRAINING FOLD
+    best_params_xgb_raw <- tune_xgb(X_data[train_idx, ], y_raw[train_idx], train_locations)
+    best_params_xgb_log <- tune_xgb(X_data[train_idx, ], y_log[train_idx], train_locations)
+    
+    train_params_raw <- best_params_xgb_raw[names(best_params_xgb_raw) != "nrounds"]
+    train_params_log <- best_params_xgb_log[names(best_params_xgb_log) != "nrounds"]
+    
+    # 2. TRAIN RAW MODEL
+    dtrain_raw <- xgb.DMatrix(data = X_data[train_idx, ], label = y_raw[train_idx])
+    dtest_raw  <- xgb.DMatrix(data = X_data[test_idx, ])
+    
+    model_xgb_raw_fold <- xgb.train(params = train_params_raw, data = dtrain_raw, nrounds = best_params_xgb_raw$nrounds)
+    current_job_data$pred_xgb_normal_raw[test_idx] <- predict(model_xgb_raw_fold, dtest_raw)
+    
+    # 3. TRAIN LOG MODEL
+    dtrain_log <- xgb.DMatrix(data = X_data[train_idx, ], label = y_log[train_idx])
+    dtest_log  <- xgb.DMatrix(data = X_data[test_idx, ])
+    
+    model_xgb_log_fold <- xgb.train(params = train_params_log, data = dtrain_log, nrounds = best_params_xgb_log$nrounds)
+    current_job_data$pred_xgb_normal_log[test_idx] <- exp(predict(model_xgb_log_fold, dtest_log))
+  }
+  
+  # --- C. EVALUATION: AGGREGATE TO COUNTRY LEVEL FOR MORAN'S I ---
+  cat("Evaluating Metrics and Residual Autocorrelation...\n")
+  
+  # 1. Calculate overall RMSE and R-Squared at the individual row level
+  resids_raw <- current_job_data$salary_usd - current_job_data$pred_xgb_normal_raw
+  resids_log <- current_job_data$salary_usd - current_job_data$pred_xgb_normal_log
+  
+  r2_raw <- 1 - (sum(resids_raw^2) / sum((current_job_data$salary_usd - mean(current_job_data$salary_usd))^2))
+  r2_log <- 1 - (sum(resids_log^2) / sum((current_job_data$salary_usd - mean(current_job_data$salary_usd))^2))
+  
+  rmse_raw <- sqrt(mean(resids_raw^2))
+  rmse_log <- sqrt(mean(resids_log^2))
+  
+  # 2. Aggregate residuals to the country level for valid Spatial Autocorrelation testing
+  country_eval <- current_job_data %>%
+    group_by(company_location) %>%
+    summarise(
+      mean_resid_raw = mean(salary_usd - pred_xgb_normal_raw, na.rm = TRUE),
+      mean_resid_log = mean(salary_usd - pred_xgb_normal_log, na.rm = TRUE)
+    ) %>%
+    ungroup()
+    
+  macro_eval <- econ_lookup %>% filter(company_location %in% country_eval$company_location)
+  country_eval <- country_eval %>% left_join(macro_eval[, c("company_location", current_macro_vars)], by = "company_location")
+  
+  # 3. Build a Country-Level Mahalanobis Weight Matrix
+  macro_mat_eval <- as.matrix(country_eval[, current_macro_vars, drop = FALSE])
+  cov_matrix_eval <- cov(macro_mat_eval)
+  if (length(current_macro_vars) == 1) cov_matrix_eval <- matrix(cov_matrix_eval, 1, 1)
+  diag(cov_matrix_eval) <- diag(cov_matrix_eval) + 1e-6 
+  inv_cov_matrix_eval <- solve(cov_matrix_eval)
+  
+  country_dist_matrix <- matrix(0, nrow = nrow(country_eval), ncol = nrow(country_eval))
+  for(i in 1:nrow(country_eval)) {
+    diff_matrix <- sweep(macro_mat_eval, 2, as.numeric(macro_mat_eval[i, ]), "-")
+    country_dist_matrix[i, ] <- sqrt(rowSums((diff_matrix %*% inv_cov_matrix_eval) * diff_matrix))
+  }
+  
+  inv_dist_weights_eval <- 1 / (country_dist_matrix + 1e-6)
+  diag(inv_dist_weights_eval) <- 0
+  
+  # 4. Calculate Moran's I on the Country-Averaged Residuals
+  moran_raw <- Moran.I(country_eval$mean_resid_raw, inv_dist_weights_eval)
+  moran_log <- Moran.I(country_eval$mean_resid_log, inv_dist_weights_eval)
+  
+  # Append to results
+  ablation_results_nxgb <- rbind(
+    ablation_results_nxgb,
+    data.frame(Combination = comb_name, Model = "Normal XGBoost (Raw)", RMSE = rmse_raw, R_Squared = r2_raw, 
+               Morans_I_Obs = moran_raw$observed, Morans_I_p = moran_raw$p.value),
+    data.frame(Combination = comb_name, Model = "Normal XGBoost (Log)", RMSE = rmse_log, R_Squared = r2_log, 
+               Morans_I_Obs = moran_log$observed, Morans_I_p = moran_log$p.value)
+  )
+}
+
+print(ablation_results_nxgb)
+```
+
+
+```{r Model Evaluation (Latest)}
+# ==============================================================================
+# 15. CONSOLIDATED MODEL EVALUATION (UNION OF FINAL ABLATION RESULTS)
+# ==============================================================================
+library(dplyr)
+library(ranger)
+library(xgboost)
+
+# 1. UNION ALL ABLATION RESULTS
+all_ablation_results <- bind_rows(
+  ablation_results_nrf,
+  ablation_results_srf,
+  ablation_results_nxgb,
+  ablation_results_sxgb
+)
+
+# 2. FILTER FOR FINAL MODELS & RETAIN THE 'Combination' COLUMN
+final_summary <- all_ablation_results %>%
+  # filter(Combination == "comb_1") %>%
+  select(Combination, Model, RMSE, R_Squared, Morans_I_Obs, Morans_I_p) %>%
+  arrange(Model)
+
+# 3. DYNAMIC FEATURE IMPORTANCE EXTRACTION
+# Ensure Spatial RF full models exist for feature extraction
+if(!exists("model_spatial_full_raw")) {
+  model_spatial_full_raw <- ranger(
+    dependent.variable.name = "salary_usd", 
+    data = data_spatial_raw[, c("salary_usd", all_predictors_raw)],
+    num.trees = 500, mtry = best_params_raw$mtry, 
+    min.node.size = best_params_raw$min.node.size, importance = "permutation", seed = 123
+  )
+}
+if(!exists("model_spatial_full_log")) {
+  model_spatial_full_log <- ranger(
+    dependent.variable.name = "log_salary_usd", 
+    data = data_spatial_log[, c("log_salary_usd", all_predictors_log)],
+    num.trees = 500, mtry = best_params_log$mtry, 
+    min.node.size = best_params_log$min.node.size, importance = "permutation", seed = 123
+  )
+}
+
+# Helper function to safely extract features
+get_features <- function(model_name) {
+  tryCatch({
+    if (grepl("Normal RF.*Raw", model_name)) return(paste(names(sort(ranger::importance(model_normal_raw), decreasing = TRUE))[1:3], collapse = ", "))
+    if (grepl("Normal RF.*Log", model_name)) return(paste(names(sort(ranger::importance(model_normal_log), decreasing = TRUE))[1:3], collapse = ", "))
+    if (grepl("Spatial RF.*Raw", model_name)) return(paste(names(sort(ranger::importance(model_spatial_full_raw), decreasing = TRUE))[1:3], collapse = ", "))
+    if (grepl("Spatial RF.*Log", model_name)) return(paste(names(sort(ranger::importance(model_spatial_full_log), decreasing = TRUE))[1:3], collapse = ", "))
+    if (grepl("Normal XGBoost.*Raw", model_name)) return(paste(head(importance_raw$Feature, 3), collapse = ", "))
+    if (grepl("Normal XGBoost.*Log", model_name)) return(paste(head(importance_log$Feature, 3), collapse = ", "))
+    if (grepl("Spatial XGBoost.*Raw", model_name)) return(paste(head(importance_spatial_raw$Feature, 3), collapse = ", "))
+    if (grepl("Spatial XGBoost.*Log", model_name)) return(paste(head(importance_spatial_log$Feature, 3), collapse = ", "))
+    return("N/A")
+  }, error = function(e) return("Error"))
+}
+
+# Apply feature extraction to the final table
+final_summary$Top_3_Features <- sapply(final_summary$Model, get_features)
+
+# Format decimals for clean printing
+final_summary <- final_summary %>%
+  mutate(
+    RMSE = sprintf("%.2f", RMSE),
+    R_Squared = sprintf("%.4f", R_Squared),
+    Morans_I_Obs = sprintf("%.4f", Morans_I_Obs),
+    Morans_I_p = sprintf("%.4e", Morans_I_p)
+  )
+
+# 4. DISPLAY RESULTS
+cat("\n========================================================================================================\n")
+cat("                                 OVERALL FINAL MODEL COMPARISON SUMMARY\n")
+cat("========================================================================================================\n")
+print(as.data.frame(final_summary))
+```
+
+
+```{r SHAP Analysis}
+# ==============================================================================
+# 16. SHAP ANALYSIS FOR ALL 8 FINAL GLOBAL MODELS (PHASE 2)
+# ==============================================================================
+# Install required packages if missing: install.packages(c("shapviz", "kernelshap", "ggplot2", "dplyr"))
+library(xgboost)
+library(ranger)
+library(shapviz)
+library(kernelshap)
+library(ggplot2)
+library(dplyr)
+load("Phase2_SHAP_Data.RData")
+
+# ==============================================================================
+# 0. PREPARE 100% DATA MATRICES FOR THE BEST COMBINATION (e.g., comb_4)
+# ==============================================================================
+cat("\nPreparing final feature matrices for SHAP Analysis (Comb_4)...\n")
+best_macro_vars <- macro_combinations[["comb_4"]]
+
+# Ensure we are using the master dataset AND merging the spatial features 
+# generated during the final comb_4 loop iteration.
+final_job_data <- job_data_econ %>%
+  left_join(spatial_features_raw, by = "company_location") %>%
+  left_join(spatial_features_log, by = "company_location")
+
+# Ensure the log dependent variable exists
+final_job_data$log_salary_usd <- log(final_job_data$salary_usd)
+
+# Define the exact features used in the final models
+features_normal <- c(base_features, best_macro_vars)
+features_spatial_raw <- c(base_features, best_macro_vars, spatial_vars_raw)
+features_spatial_log <- c(base_features, best_macro_vars, spatial_vars_log)
+
+# Construct the matrices needed for SHAP evaluation
+X_normal <- as.matrix(final_job_data[, features_normal])
+X_spatial_raw <- as.matrix(final_job_data[, features_spatial_raw])
+X_spatial_log <- as.matrix(final_job_data[, features_spatial_log])
+
+
+# ==============================================================================
+# 1. SHAP FOR XGBOOST MODELS (Native & Fast TreeSHAP)
+# ==============================================================================
+cat("\nExtracting SHAP values for XGBoost Models (100% of data)...\n")
+
+# Normal XGBoost Models (Assumes model_xgb_full_raw and log were trained in Phase 2)
+shp_xgb_normal_raw <- shapviz(model_xgb_full_raw, X_pred = X_normal)
+shp_xgb_normal_log <- shapviz(model_xgb_full_log, X_pred = X_normal)
+
+# Spatial XGBoost Models (Assumes model_xgb_spatial_full_raw and log were trained in Phase 2)
+shp_xgb_spatial_raw <- shapviz(model_xgb_spatial_full_raw, X_pred = X_spatial_raw)
+shp_xgb_spatial_log <- shapviz(model_xgb_spatial_full_log, X_pred = X_spatial_log)
+
+
+# ==============================================================================
+# 2. SHAP FOR RANDOM FOREST MODELS (via Model-Agnostic KernelSHAP)
+# ==============================================================================
+cat("\nExtracting SHAP values for Random Forest Models (Using ~500-row stratified sample)...\n")
+
+# --- STRATIFIED SAMPLING BY COUNTRY ---
+set.seed(123)
+
+# 1. Calculate how many rows to sample per country to get ~500 total proportionally
+country_counts <- table(final_job_data$company_location)
+target_total <- 500
+
+# Calculate sizes and FORCE the country names back onto the vector
+sample_sizes <- pmax(1, round(country_counts * target_total / nrow(final_job_data)))
+names(sample_sizes) <- names(country_counts)
+
+# 2. Extract indices proportionally, ensuring every country gets at least 1 representative
+sample_idx <- unlist(lapply(names(country_counts), function(country) {
+  indices <- which(final_job_data$company_location == country)
+  size <- min(length(indices), sample_sizes[country])
+  
+  # R's sample() has a quirk where if length(indices)==1, it samples from 1:indices.
+  # To be 100% safe for countries with exactly 1 row:
+  if(length(indices) == 1) return(indices)
+  
+  sample(indices, size)
+}))
+
+# 3. Shuffle the final indices
+sample_idx <- sample(sample_idx)
+
+cat(sprintf("Stratified sample created: %d rows representing all %d countries.\n", 
+            length(sample_idx), length(unique(final_job_data$company_location[sample_idx]))))
+
+# ------------------------------------------------------------------------------
+# Define a prediction wrapper for ranger models so they accept matrix inputs correctly
+pred_rf <- function(model, X) {
+  predict(model, data = as.data.frame(X))$predictions
+}
+
+# --- Normal Random Forest ---
+ks_rf_normal_raw <- kernelshap(model_rf_full_raw, X = X_normal[sample_idx, ], 
+                               bg_X = X_normal[sample_idx, ], pred_fun = pred_rf)
+shp_rf_normal_raw <- shapviz(ks_rf_normal_raw)
+
+ks_rf_normal_log <- kernelshap(model_rf_full_log, X = X_normal[sample_idx, ], 
+                               bg_X = X_normal[sample_idx, ], pred_fun = pred_rf)
+shp_rf_normal_log <- shapviz(ks_rf_normal_log)
+
+# --- Spatial Random Forest ---
+ks_rf_spatial_raw <- kernelshap(model_spatial_full_raw, X = X_spatial_raw[sample_idx, ], 
+                                bg_X = X_spatial_raw[sample_idx, ], pred_fun = pred_rf)
+shp_rf_spatial_raw <- shapviz(ks_rf_spatial_raw)
+
+ks_rf_spatial_log <- kernelshap(model_spatial_full_log, X = X_spatial_log[sample_idx, ], 
+                                bg_X = X_spatial_log[sample_idx, ], pred_fun = pred_rf)
+shp_rf_spatial_log <- shapviz(ks_rf_spatial_log)
+
+
+# ==============================================================================
+# 3. VISUALIZING THE RESULTS
+# ==============================================================================
+cat("\nGenerating SHAP Summary Plots for the Final Global Models...\n")
+
+# --- XGBoost Models ---
+p_xgb_normal_raw <- sv_importance(shp_xgb_normal_raw, kind = "beeswarm", max_display = 10) + 
+  ggtitle("SHAP Summary: Normal XGBoost (Raw, Comb 4)") + theme_minimal()
+
+p_xgb_normal_log <- sv_importance(shp_xgb_normal_log, kind = "beeswarm", max_display = 10) + 
+  ggtitle("SHAP Summary: Normal XGBoost (Log, Comb 4)") + theme_minimal()
+
+p_xgb_spatial_raw <- sv_importance(shp_xgb_spatial_raw, kind = "beeswarm", max_display = 10) + 
+  ggtitle("SHAP Summary: Spatial XGBoost (Raw, Comb 4)") + theme_minimal()
+
+p_xgb_spatial_log <- sv_importance(shp_xgb_spatial_log, kind = "beeswarm", max_display = 10) + 
+  ggtitle("SHAP Summary: Spatial XGBoost (Log, Comb 4)") + theme_minimal()
+
+# --- Random Forest Models ---
+p_rf_normal_raw <- sv_importance(shp_rf_normal_raw, kind = "beeswarm", max_display = 10) + 
+  ggtitle("SHAP Summary: Normal Random Forest (Raw, Comb 4)") + theme_minimal()
+
+p_rf_normal_log <- sv_importance(shp_rf_normal_log, kind = "beeswarm", max_display = 10) + 
+  ggtitle("SHAP Summary: Normal Random Forest (Log, Comb 4)") + theme_minimal()
+
+p_rf_spatial_raw <- sv_importance(shp_rf_spatial_raw, kind = "beeswarm", max_display = 10) + 
+  ggtitle("SHAP Summary: Spatial Random Forest (Raw, Comb 4)") + theme_minimal()
+
+p_rf_spatial_log <- sv_importance(shp_rf_spatial_log, kind = "beeswarm", max_display = 10) + 
+  ggtitle("SHAP Summary: Spatial Random Forest (Log, Comb 4)") + theme_minimal()
+
+# Display them one by one:
+print(p_xgb_normal_raw)
+print(p_xgb_normal_log)
+print(p_xgb_spatial_raw)
+print(p_xgb_spatial_log)
+print(p_rf_normal_raw)
+print(p_rf_normal_log)
+print(p_rf_spatial_raw)
+print(p_rf_spatial_log)
+```
+
+```{r Save SHAP}
+library(xgboost)
+library(ranger)
+library(dplyr)
+
+cat("\n--- STARTING PHASE 2: GLOBAL MODEL TRAINING (100% DATA) ---\n")
+
+# 1. RECONSTRUCT THE MASTER DATASET FOR COMBINATION 4
+best_macro_vars <- macro_combinations[["comb_4"]]
+
+final_job_data <- job_data_econ %>%
+  left_join(spatial_features_raw, by = "company_location") %>%
+  left_join(spatial_features_log, by = "company_location")
+
+final_job_data$log_salary_usd <- log(final_job_data$salary_usd)
+
+# 2. DEFINE 100% FEATURE MATRICES
+features_normal <- c(base_features, best_macro_vars)
+features_spatial_raw <- c(base_features, best_macro_vars, spatial_vars_raw)
+features_spatial_log <- c(base_features, best_macro_vars, spatial_vars_log)
+
+X_normal <- as.matrix(final_job_data[, features_normal])
+X_spatial_raw <- as.matrix(final_job_data[, features_spatial_raw])
+X_spatial_log <- as.matrix(final_job_data[, features_spatial_log])
+
+y_raw <- final_job_data$salary_usd
+y_log <- final_job_data$log_salary_usd
+train_locations <- final_job_data$company_location
+
+# 3. TRAIN GLOBAL RANDOM FOREST MODELS
+cat("Training Global Random Forest Models...\n")
+model_rf_full_raw <- ranger(x = X_normal, y = y_raw, num.trees = 500, importance = "permutation", seed = 123)
+model_rf_full_log <- ranger(x = X_normal, y = y_log, num.trees = 500, importance = "permutation", seed = 123)
+
+model_spatial_full_raw <- ranger(x = X_spatial_raw, y = y_raw, num.trees = 500, importance = "permutation", seed = 123)
+model_spatial_full_log <- ranger(x = X_spatial_log, y = y_log, num.trees = 500, importance = "permutation", seed = 123)
+
+# 4. TRAIN GLOBAL XGBOOST MODELS (Re-using your tune_xgb function)
+cat("Tuning & Training Global XGBoost Models...\n")
+
+best_params_n_raw <- tune_xgb(X_normal, y_raw, train_locations)
+model_xgb_full_raw <- xgb.train(params = best_params_n_raw[names(best_params_n_raw) != "nrounds"], 
+                                data = xgb.DMatrix(X_normal, label = y_raw), nrounds = best_params_n_raw$nrounds)
+
+best_params_n_log <- tune_xgb(X_normal, y_log, train_locations)
+model_xgb_full_log <- xgb.train(params = best_params_n_log[names(best_params_n_log) != "nrounds"], 
+                                data = xgb.DMatrix(X_normal, label = y_log), nrounds = best_params_n_log$nrounds)
+
+best_params_s_raw <- tune_xgb(X_spatial_raw, y_raw, train_locations)
+model_xgb_spatial_full_raw <- xgb.train(params = best_params_s_raw[names(best_params_s_raw) != "nrounds"], 
+                                        data = xgb.DMatrix(X_spatial_raw, label = y_raw), nrounds = best_params_s_raw$nrounds)
+
+best_params_s_log <- tune_xgb(X_spatial_log, y_log, train_locations)
+model_xgb_spatial_full_log <- xgb.train(params = best_params_s_log[names(best_params_s_log) != "nrounds"], 
+                                        data = xgb.DMatrix(X_spatial_log, label = y_log), nrounds = best_params_s_log$nrounds)
+
+# 5. SAVE EXACTLY WHAT IS NEEDED FOR SHAP (AND NOTHING ELSE)
+cat("Packaging final models for SHAP extraction...\n")
+save(
+  final_job_data,
+  base_features, best_macro_vars, spatial_vars_raw, spatial_vars_log,
+  model_xgb_full_raw, model_xgb_full_log,
+  model_xgb_spatial_full_raw, model_xgb_spatial_full_log,
+  model_rf_full_raw, model_rf_full_log,
+  model_spatial_full_raw, model_spatial_full_log,
+  file = "Phase2_SHAP_Data.RData"
+)
+
+cat("\n--- SUCCESS: Phase 2 Complete. File 'Phase2_SHAP_Data.RData' is ready. ---\n")
+```
+
+
+
+
+
+
