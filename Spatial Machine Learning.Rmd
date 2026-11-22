@@ -10,7 +10,7 @@ knitr::opts_chunk$set(echo = TRUE)
 ```
 
 
-```{r Data Cleansing}
+```{r Data Cleansing (LOCO CV)}
 # ==============================================================================
 # DATA CLEANSING & FEATURE ENGINEERING (EXPANDED ARBITRAGE UNIVERSE)
 # ==============================================================================
@@ -21,7 +21,7 @@ library(parallel)
 library(lightgbm)
 library(stats) 
 
-file_path <- "C:/Users/user/Desktop/UM/OneDrive - Universiti Malaya/SQB7038 Research Project/Dataset/Global AI Job Market & Salary Trends 2025/ai_job_dataset1.csv"
+file_path <- "C:/Users/user/Desktop/UM/OneDrive - Universiti Malaya/SQB7038 Research Project/UM PG Research Project/Dataset/Global AI Job Market & Salary Trends 2025/ai_job_dataset1.csv"
 job_data <- read.csv(file_path)
 
 # 3. EXPANDED ECONOMIC LOOKUP TABLE (52 Countries Total)
@@ -183,18 +183,184 @@ job_data_econ <- cbind(job_data_econ, industry_dummies)
 # rigorously test the model's ability to generalize to entirely unseen countries 
 # and regions."
 # ==============================================================================
+# ==============================================================================
+# 6. SPATIAL BLOCK CROSS-VALIDATION (BALANCED LOCO)
+# ==============================================================================
 set.seed(123)
 unique_countries <- unique(job_data_econ$company_location)
 
-# Assign entire countries to folds rather than stratifying rows, satisfying LOCO CV
+# Use rep() to ensure perfectly even distribution of the 20 countries across 5 folds
 country_folds <- data.frame(
   company_location = unique_countries,
-  fold = sample(1:5, length(unique_countries), replace = TRUE)
+  fold = sample(rep(1:5, length.out = length(unique_countries)))
 )
 
 job_data_econ <- job_data_econ %>%
   left_join(country_folds, by = "company_location")
 ```
+
+```{r Data Cleansing (Stratified 5-Fold CV)}
+# ==============================================================================
+# DATA CLEANSING & FEATURE ENGINEERING (EXPANDED ARBITRAGE UNIVERSE)
+# ==============================================================================
+
+library(dplyr)
+library(spatialRF)
+library(parallel)
+library(lightgbm)
+library(stats) 
+
+file_path <- "C:/Users/user/Desktop/UM/OneDrive - Universiti Malaya/SQB7038 Research Project/UM PG Research Project/Dataset/Global AI Job Market & Salary Trends 2025/ai_job_dataset1.csv"
+job_data <- read.csv(file_path)
+
+# 3. EXPANDED ECONOMIC LOOKUP TABLE (52 Countries Total)
+# All indices uniformly updated to 2025 releases to ensure stable covariance 
+econ_lookup <- data.frame(
+  company_location = c(
+    # Original 28 Countries
+    "United States", "United Kingdom", "Germany", "Canada", "India", 
+    "France", "Spain", "Australia", "Netherlands", "Singapore",
+    "Republic of Korea", "Brazil", "Japan", "United Arab Emirates", 
+    "Mexico", "Poland", "Italy", "Switzerland", "Greece", "Malaysia",
+    "China", "Denmark", "Israel", "Ireland", "Norway", "Sweden", 
+    "Finland", "Austria",
+    # 24 New Remote Residence Countries
+    "Argentina", "Belgium", "Chile", "Colombia", "Czech Republic", "Egypt", 
+    "Estonia", "Ghana", "Hungary", "Indonesia", "Kenya", "Latvia", 
+    "Luxembourg", "New Zealand", "Nigeria", "Philippines", "Portugal", 
+    "Romania", "Russia", "South Africa", "Thailand", "Turkey", "Ukraine", "Vietnam"
+  ),
+  
+  # IMF WEO Oct 2024 (Projections for 2025 in USD Thousands)
+  gdp_pc = c(
+    89.105, 54.949, 55.911, 53.558, 2.878, 46.792, 36.192, 64.547, 70.480, 92.932, 
+    34.642, 9.964, 33.956, 49.498, 12.692, 26.805, 41.091, 104.896, 25.756, 13.145, 
+    13.687, 74.969, 57.760, 108.919, 89.694, 58.100, 54.163, 58.192, 
+    14.362, 57.772, 17.015, 8.054, 33.039, 3.174, 32.760, 2.519, 24.809, 5.027, 
+    2.468, 24.374, 140.941, 46.126, 0.807, 4.350, 30.002, 21.421, 14.258, 6.397, 
+    7.767, 16.709, 6.261, 4.806
+  ),
+             
+  # Numbeo 2025 Cost of Living Index
+  cost_of_living = c(
+    64.9, 59.2, 58.4, 58.7, 19.5, 58.0, 43.5, 60.9, 60.5, 79.1,
+    56.5, 25.6, 45.6, 54.1, 34.5, 38.9, 51.0, 98.4, 46.5, 29.7,
+    30.7, 66.9, 65.2, 59.8, 69.0, 54.2, 58.7, 60.7,
+    35.7, 56.5, 35.1, 26.0, 42.6, 19.0, 49.4, 30.6, 36.6, 24.6, 
+    28.2, 43.4, 64.8, 55.3, 26.4, 28.8, 41.2, 34.0, 22.3, 30.0, 
+    33.7, 34.7, 24.6, 26.6
+  ),
+                   
+  # Observer Global AI Index 2025 (Standardized to Overall Global Rank; 1 = Highest)
+  tech_index = c(
+    1, 4, 9, 8, 17, 6, 22, 21, 13, 3, 
+    5, 25, 11, 10, 76, 37, 28, 12, 31, 24, 
+    2, 18, 7, 23, 20, 19, 15, 32, 
+    77, 33, 46, 53, 43, 47, 26, 61, 34, 45, 
+    74, 60, 27, 35, 69, 48, 41, 50, 29, 54, 
+    42, 49, 64, 40
+  ),
+  
+  # INSEAD GTCI 2025 Index Scores
+  human_capital_index = c(
+    69.41, 67.52, 65.73, 66.40, 34.03, 62.88, 59.32, 69.27, 70.26, 73.29, 
+    58.08, 44.04, 58.59, 59.36, 43.67, 53.70, 57.35, 73.14, 52.38, 50.20, 
+    48.65, 72.05, 60.16, 68.73, 69.84, 70.76, 71.06, 65.86, 
+    47.59, 66.05, 52.66, 43.94, 62.52, 36.62, 61.92, 33.43, 52.80, 41.18, 
+    34.30, 54.59, 69.84, 64.16, 30.51, 42.39, 59.90, 48.24, 46.09, 41.19, 
+    41.93, 40.96, 46.31, 42.25
+  )
+)
+
+# 4. DATA PRE-PROCESSING, JOINING & ECONOMIC ARBITRAGE 
+
+job_data <- job_data %>%
+  mutate(
+    company_location = case_when(
+      company_location == "United States of America" ~ "United States",
+      company_location == "South Korea" ~ "Republic of Korea",
+      TRUE ~ company_location
+    ),
+    employee_residence = case_when(
+      employee_residence == "United States of America" ~ "United States",
+      employee_residence == "South Korea" ~ "Republic of Korea",
+      TRUE ~ employee_residence
+    )
+  )
+
+# A. Join Macro Data for the Company Location
+job_data_econ <- job_data %>%
+  left_join(econ_lookup, by = "company_location") %>%
+  filter(!is.na(gdp_pc)) 
+
+# B. Join Macro Data for the Employee Residence (to calculate Arbitrage)
+econ_lookup_emp <- econ_lookup %>%
+  rename(
+    employee_residence = company_location,
+    emp_gdp_pc = gdp_pc,
+    emp_cost_of_living = cost_of_living
+  ) %>%
+  select(employee_residence, emp_gdp_pc, emp_cost_of_living)
+
+job_data_econ <- job_data_econ %>%
+  left_join(econ_lookup_emp, by = "employee_residence") %>%
+  # Fallback logic retained strictly for unmapped future test data, 
+  # but will not trigger for our defined 52 countries.
+  mutate(
+    emp_gdp_pc = ifelse(is.na(emp_gdp_pc), gdp_pc, emp_gdp_pc),
+    emp_cost_of_living = ifelse(is.na(emp_cost_of_living), cost_of_living, emp_cost_of_living)
+  ) %>%
+  # C. Create Arbitrage Features
+  mutate(
+    arbitrage_gdp_ratio = gdp_pc / emp_gdp_pc,
+    arbitrage_col_ratio = cost_of_living / emp_cost_of_living
+  )
+
+# 5. CATEGORICAL TO NUMERICAL TRANSFORMATION
+job_data_econ <- job_data_econ %>%
+  mutate(
+    company_size_num = case_when(
+      company_size == "S" ~ 1,
+      company_size == "M" ~ 2,
+      company_size == "L" ~ 3,
+      TRUE ~ 0
+    ),
+    education_num = case_when(
+      education_required == "Associate" ~ 1,
+      education_required == "Bachelor"  ~ 2,
+      education_required == "Master"    ~ 3,
+      education_required == "PhD"       ~ 4,
+      TRUE ~ 0
+    )
+  )
+
+industry_dummies <- model.matrix(~ industry - 1, data = job_data_econ)
+colnames(industry_dummies) <- make.names(colnames(industry_dummies))
+job_data_econ <- cbind(job_data_econ, industry_dummies)
+
+
+# ==============================================================================
+# 6. STRATIFIED CROSS-VALIDATION (PREVIOUS APPROACH - SPATIAL INTERPOLATION)
+# ==============================================================================
+
+# Note: This removes Spatial Block CV (LOCO). It groups the data by country 
+# and evenly distributes each country's rows across 5 folds, allowing the 
+# model to "see" every country during training (Spatial Interpolation).
+
+set.seed(123)
+job_data_econ <- job_data_econ %>%
+  group_by(company_location) %>%
+  # sample(rep()) ensures that the 1-5 folds are distributed as evenly 
+  # as possible within each country's specific row count
+  mutate(fold = sample(rep(1:5, length.out = n()))) %>%
+  ungroup()
+
+# Double-check the fold distribution to ensure no data leakage was introduced mechanically
+cat("Stratified 5-Fold Distribution Check:\n")
+print(table(job_data_econ$fold))
+```
+
+
 
 ```{r EDA}
 # ==============================================================================
@@ -534,17 +700,21 @@ for (comb_name in names(macro_combinations)) {
 ```
 
 
+
+
 ```{r Spatial Random Forest with Economic Distance (Enhance)}
 # ==============================================================================
 # ABLATION STUDY: SPATIAL RANDOM FOREST (RAW VS LOG) - NESTED CV ENHANCED
-# (Updated with Mahalanobis Distance, Fold-Isolated MEMs, Spatial Block CV, MEM Failsafe,
-#  and Country-Level Moran's I Evaluation)
+# (Updated with Distance Toggle, Fold-Isolated MEMs, Spatial Block CV, & Row-Level Moran's I)
 # ==============================================================================
 library(ranger)
 library(spatialRF)
 library(dplyr)
 library(ape)   # Required for Moran's I
 library(stats) # Required for cov()
+
+# --- NEW: DISTANCE TOGGLE ---
+distance_method <- "mahalanobis" # Change to "mahalanobis" to toggle distance calculation
 
 # 0. DEFINE ABLATION COMBINATIONS & PREPARE STORAGE
 macro_combinations <- list(
@@ -660,7 +830,7 @@ for (comb_name in names(macro_combinations)) {
     test_data  <- current_job_data[test_idx, ]
     
     # ------------------------------------------------------------------------------
-    # STEP 1: CALCULATE MAHALANOBIS DISTANCE ONLY ON TRAINING DATA 
+    # STEP 1: CALCULATE DISTANCE MATRIX ONLY ON TRAINING DATA 
     # ------------------------------------------------------------------------------
     train_country_summary <- train_data %>%
       group_by(company_location) %>%
@@ -679,15 +849,24 @@ for (comb_name in names(macro_combinations)) {
     train_country_summary <- train_country_summary %>% left_join(macro_summary[, c("company_location", current_macro_vars)], by = "company_location")
     
     macro_mat_train <- as.matrix(train_country_summary[, current_macro_vars, drop = FALSE])
-    cov_matrix_train <- cov(macro_mat_train)
-    if (length(current_macro_vars) == 1) cov_matrix_train <- matrix(cov_matrix_train, 1, 1)
-    diag(cov_matrix_train) <- diag(cov_matrix_train) + 1e-6 
-    inv_cov_matrix_train <- solve(cov_matrix_train)
-    
     train_dist_matrix <- matrix(0, nrow = nrow(train_country_summary), ncol = nrow(train_country_summary))
-    for(i in 1:nrow(train_country_summary)) {
-      diff_matrix <- sweep(macro_mat_train, 2, as.numeric(macro_mat_train[i, ]), "-")
-      train_dist_matrix[i, ] <- sqrt(rowSums((diff_matrix %*% inv_cov_matrix_train) * diff_matrix))
+    
+    if(distance_method == "mahalanobis") {
+      cov_matrix_train <- cov(macro_mat_train)
+      if (length(current_macro_vars) == 1) cov_matrix_train <- matrix(cov_matrix_train, 1, 1)
+      diag(cov_matrix_train) <- diag(cov_matrix_train) + 1e-6 
+      inv_cov_matrix_train <- solve(cov_matrix_train)
+      
+      for(i in 1:nrow(train_country_summary)) {
+        diff_matrix <- sweep(macro_mat_train, 2, as.numeric(macro_mat_train[i, ]), "-")
+        train_dist_matrix[i, ] <- sqrt(rowSums((diff_matrix %*% inv_cov_matrix_train) * diff_matrix))
+      }
+    } else {
+      # Default to Euclidean Distance
+      for(i in 1:nrow(train_country_summary)) {
+        diff_matrix <- sweep(macro_mat_train, 2, as.numeric(macro_mat_train[i, ]), "-")
+        train_dist_matrix[i, ] <- sqrt(rowSums(diff_matrix^2))
+      }
     }
     rownames(train_dist_matrix) <- train_country_summary$company_location
     colnames(train_dist_matrix) <- train_country_summary$company_location
@@ -729,7 +908,12 @@ for (comb_name in names(macro_combinations)) {
       test_country_macro <- as.matrix(econ_lookup[econ_lookup$company_location == test_country, current_macro_vars, drop = FALSE])
       
       diff_matrix <- sweep(macro_mat_train, 2, as.numeric(test_country_macro), "-")
-      dist_to_train <- sqrt(rowSums((diff_matrix %*% inv_cov_matrix_train) * diff_matrix))
+      
+      if(distance_method == "mahalanobis") {
+        dist_to_train <- sqrt(rowSums((diff_matrix %*% inv_cov_matrix_train) * diff_matrix))
+      } else {
+        dist_to_train <- sqrt(rowSums(diff_matrix^2))
+      }
       
       inv_weights <- 1 / (dist_to_train + 1e-6)
       normalized_weights <- inv_weights / sum(inv_weights)
@@ -776,9 +960,9 @@ for (comb_name in names(macro_combinations)) {
   }
   
   # ==============================================================================
-  # EVALUATION: AGGREGATE TO COUNTRY LEVEL FOR MORAN'S I 
+  # EVALUATION: INDIVIDUAL ROW LEVEL (15,000 Records - Weighted by Dataset Composition)
   # ==============================================================================
-  cat("Evaluating Metrics and Residual Autocorrelation...\n")
+  cat("Evaluating Metrics and Residual Autocorrelation on full dataset...\n")
   
   # 1. Calculate overall RMSE and R-Squared at the individual row level
   resids_raw <- current_job_data$salary_usd - current_job_data$pred_rf_spatial_raw
@@ -790,37 +974,36 @@ for (comb_name in names(macro_combinations)) {
   rmse_raw <- sqrt(mean(resids_raw^2))
   rmse_log <- sqrt(mean(resids_log^2))
   
-  # 2. Aggregate residuals to the country level for valid Spatial Autocorrelation testing
-  country_eval <- current_job_data %>%
-    group_by(company_location) %>%
-    summarise(
-      mean_resid_raw = mean(salary_usd - pred_rf_spatial_raw, na.rm = TRUE),
-      mean_resid_log = mean(salary_usd - pred_rf_spatial_log, na.rm = TRUE)
-    ) %>%
-    ungroup()
+  # 2. Build Full Row-Level Distance Matrix based on selected method
+  macro_mat_full <- as.matrix(current_job_data[, current_macro_vars, drop = FALSE])
+  full_mahalanobis_dist <- matrix(0, nrow = nrow(current_job_data), ncol = nrow(current_job_data))
+  
+  if(distance_method == "mahalanobis") {
+    cov_matrix_full <- cov(macro_mat_full)
+    if (length(current_macro_vars) == 1) cov_matrix_full <- matrix(cov_matrix_full, 1, 1)
+    diag(cov_matrix_full) <- diag(cov_matrix_full) + 1e-6 
+    inv_cov_matrix_full <- solve(cov_matrix_full)
     
-  macro_eval <- econ_lookup %>% filter(company_location %in% country_eval$company_location)
-  country_eval <- country_eval %>% left_join(macro_eval[, c("company_location", current_macro_vars)], by = "company_location")
-  
-  # 3. Build a Country-Level Mahalanobis Weight Matrix
-  macro_mat_eval <- as.matrix(country_eval[, current_macro_vars, drop = FALSE])
-  cov_matrix_eval <- cov(macro_mat_eval)
-  if (length(current_macro_vars) == 1) cov_matrix_eval <- matrix(cov_matrix_eval, 1, 1)
-  diag(cov_matrix_eval) <- diag(cov_matrix_eval) + 1e-6 
-  inv_cov_matrix_eval <- solve(cov_matrix_eval)
-  
-  country_dist_matrix <- matrix(0, nrow = nrow(country_eval), ncol = nrow(country_eval))
-  for(i in 1:nrow(country_eval)) {
-    diff_matrix <- sweep(macro_mat_eval, 2, as.numeric(macro_mat_eval[i, ]), "-")
-    country_dist_matrix[i, ] <- sqrt(rowSums((diff_matrix %*% inv_cov_matrix_eval) * diff_matrix))
+    for(i in 1:nrow(current_job_data)) {
+      diff_matrix <- sweep(macro_mat_full, 2, as.numeric(macro_mat_full[i, ]), "-")
+      full_mahalanobis_dist[i, ] <- sqrt(rowSums((diff_matrix %*% inv_cov_matrix_full) * diff_matrix))
+    }
+  } else {
+    # Default to Euclidean Distance
+    for(i in 1:nrow(current_job_data)) {
+      diff_matrix <- sweep(macro_mat_full, 2, as.numeric(macro_mat_full[i, ]), "-")
+      full_mahalanobis_dist[i, ] <- sqrt(rowSums(diff_matrix^2))
+    }
   }
   
-  inv_dist_weights_eval <- 1 / (country_dist_matrix + 1e-6)
-  diag(inv_dist_weights_eval) <- 0
+  # 3. THE ROW-LEVEL FIX: Use 1 / (Distance + 1)
+  # This prevents 1/0 = Inf. Workers in the same country (Distance 0) get a max weight of 1.
+  inv_dist_weights_full <- 1 / (full_mahalanobis_dist + 1)
+  diag(inv_dist_weights_full) <- 0 # A row cannot be its own neighbor
   
-  # 4. Calculate Moran's I on the Country-Averaged Residuals
-  moran_raw <- Moran.I(country_eval$mean_resid_raw, inv_dist_weights_eval)
-  moran_log <- Moran.I(country_eval$mean_resid_log, inv_dist_weights_eval)
+  # 4. Calculate Moran's I on all ~15,000 residuals
+  moran_raw <- Moran.I(resids_raw, inv_dist_weights_full)
+  moran_log <- Moran.I(resids_log, inv_dist_weights_full)
   
   ablation_results_srf <- rbind(
     ablation_results_srf,
@@ -835,15 +1018,19 @@ print(ablation_results_srf)
 ```
 
 
+
 ```{r Normal Random Forest}
 # ==============================================================================
 # ABLATION STUDY: NORMAL RANDOM FOREST (RAW VS LOG) - NESTED CV ENHANCED
-# (Updated with Spatial Block CV & Country-Level Moran's I Evaluation)
+# (Updated with Distance Toggle, Spatial Block CV & Row-Level Moran's I Evaluation)
 # ==============================================================================
 library(ranger)
 library(dplyr)
 library(ape)   # Required for Moran's I
 library(stats) # Required for cov()
+
+# --- NEW: DISTANCE TOGGLE ---
+distance_method <- "mahalanobis" # Change to "mahalanobis" to toggle distance calculation
 
 # 0. DEFINE ABLATION COMBINATIONS & PREPARE STORAGE
 macro_combinations <- list(
@@ -863,7 +1050,8 @@ ablation_results_nrf <- data.frame(
 # Base predictors (Including Economic Arbitrage from Feedback #1)
 base_features_str <- paste(
   "years_experience", "remote_ratio", "company_size_num", 
-  "education_num", "benefits_score", "arbitrage_gdp_ratio", "arbitrage_col_ratio",
+  "education_num", "benefits_score", 
+  "arbitrage_gdp_ratio", "arbitrage_col_ratio",
   paste(colnames(industry_dummies), collapse = " + "), 
   sep = " + "
 )
@@ -934,8 +1122,8 @@ for (comb_name in names(macro_combinations)) {
     current_job_data$pred_rf_normal_log[test_idx] <- exp(predict(model_normal_log_fold, data = current_job_data[test_idx, ])$predictions)
   }
   
-  # --- D. EVALUATION: AGGREGATE TO COUNTRY LEVEL FOR MORAN'S I ---
-  cat("Evaluating Metrics and Residual Autocorrelation...\n")
+  # --- D. EVALUATION: INDIVIDUAL ROW LEVEL (15,000 Records - Weighted by Dataset Composition) ---
+  cat("Evaluating Metrics and Residual Autocorrelation on full dataset...\n")
   
   # 1. Calculate overall RMSE and R-Squared at the individual row level
   resids_raw <- current_job_data$salary_usd - current_job_data$pred_rf_normal_raw
@@ -947,37 +1135,36 @@ for (comb_name in names(macro_combinations)) {
   rmse_raw <- sqrt(mean(resids_raw^2))
   rmse_log <- sqrt(mean(resids_log^2))
   
-  # 2. Aggregate residuals to the country level for valid Spatial Autocorrelation testing
-  country_eval <- current_job_data %>%
-    group_by(company_location) %>%
-    summarise(
-      mean_resid_raw = mean(salary_usd - pred_rf_normal_raw, na.rm = TRUE),
-      mean_resid_log = mean(salary_usd - pred_rf_normal_log, na.rm = TRUE)
-    ) %>%
-    ungroup()
+  # 2. Build Full Row-Level Distance Matrix based on selected method
+  macro_mat_full <- as.matrix(current_job_data[, current_macro_vars, drop = FALSE])
+  full_mahalanobis_dist <- matrix(0, nrow = nrow(current_job_data), ncol = nrow(current_job_data))
+  
+  if(distance_method == "mahalanobis") {
+    cov_matrix_full <- cov(macro_mat_full)
+    if (length(current_macro_vars) == 1) cov_matrix_full <- matrix(cov_matrix_full, 1, 1)
+    diag(cov_matrix_full) <- diag(cov_matrix_full) + 1e-6 
+    inv_cov_matrix_full <- solve(cov_matrix_full)
     
-  macro_eval <- econ_lookup %>% filter(company_location %in% country_eval$company_location)
-  country_eval <- country_eval %>% left_join(macro_eval[, c("company_location", current_macro_vars)], by = "company_location")
-  
-  # 3. Build a Country-Level Mahalanobis Weight Matrix
-  macro_mat_eval <- as.matrix(country_eval[, current_macro_vars, drop = FALSE])
-  cov_matrix_eval <- cov(macro_mat_eval)
-  if (length(current_macro_vars) == 1) cov_matrix_eval <- matrix(cov_matrix_eval, 1, 1)
-  diag(cov_matrix_eval) <- diag(cov_matrix_eval) + 1e-6 
-  inv_cov_matrix_eval <- solve(cov_matrix_eval)
-  
-  country_dist_matrix <- matrix(0, nrow = nrow(country_eval), ncol = nrow(country_eval))
-  for(i in 1:nrow(country_eval)) {
-    diff_matrix <- sweep(macro_mat_eval, 2, as.numeric(macro_mat_eval[i, ]), "-")
-    country_dist_matrix[i, ] <- sqrt(rowSums((diff_matrix %*% inv_cov_matrix_eval) * diff_matrix))
+    for(i in 1:nrow(current_job_data)) {
+      diff_matrix <- sweep(macro_mat_full, 2, as.numeric(macro_mat_full[i, ]), "-")
+      full_mahalanobis_dist[i, ] <- sqrt(rowSums((diff_matrix %*% inv_cov_matrix_full) * diff_matrix))
+    }
+  } else {
+    # Default to Euclidean Distance
+    for(i in 1:nrow(current_job_data)) {
+      diff_matrix <- sweep(macro_mat_full, 2, as.numeric(macro_mat_full[i, ]), "-")
+      full_mahalanobis_dist[i, ] <- sqrt(rowSums(diff_matrix^2))
+    }
   }
   
-  inv_dist_weights_eval <- 1 / (country_dist_matrix + 1e-6)
-  diag(inv_dist_weights_eval) <- 0
+  # 3. THE ROW-LEVEL FIX: Use 1 / (Distance + 1)
+  # This prevents 1/0 = Inf. Workers in the same country (Distance 0) get a max weight of 1.
+  inv_dist_weights_full <- 1 / (full_mahalanobis_dist + 1)
+  diag(inv_dist_weights_full) <- 0 # A row cannot be its own neighbor
   
-  # 4. Calculate Moran's I on the Country-Averaged Residuals
-  moran_raw <- Moran.I(country_eval$mean_resid_raw, inv_dist_weights_eval)
-  moran_log <- Moran.I(country_eval$mean_resid_log, inv_dist_weights_eval)
+  # 4. Calculate Moran's I on all ~15,000 residuals
+  moran_raw <- Moran.I(resids_raw, inv_dist_weights_full)
+  moran_log <- Moran.I(resids_log, inv_dist_weights_full)
   
   ablation_results_nrf <- rbind(
     ablation_results_nrf,
@@ -992,17 +1179,20 @@ print(ablation_results_nrf)
 ```
 
 
+
 ```{r MEM XGBoost}
 # ==============================================================================
 # ABLATION STUDY: SPATIAL XGBOOST (RAW VS LOG) - NESTED CV ENHANCED
-# (Updated with Spatial Block CV, Mahalanobis MEM Projection, Failsafe, 
-#  & Country-Level Moran's I Evaluation)
+# (Updated with Distance Toggle, Spatial Block CV, MEM Projection & Row-Level Evaluation)
 # ==============================================================================
 library(xgboost)
 library(dplyr)
 library(spatialRF)
 library(ape)   # Added ape for consistent Moran's I evaluation
 library(stats) # Required for cov()
+
+# --- NEW: DISTANCE TOGGLE ---
+distance_method <- "mahalanobis" # Change to "mahalanobis" to toggle distance calculation
 
 # 0. DEFINE ABLATION COMBINATIONS & STORAGE
 macro_combinations <- list(
@@ -1019,7 +1209,7 @@ ablation_results_sxgb <- data.frame(
   stringsAsFactors = FALSE
 )
 
-# Base predictors (Including Economic Arbitrage from Feedback #1)
+# Base predictors (Including Economic Arbitrage Features)
 industry_cols <- colnames(industry_dummies)
 base_features <- c("years_experience", "remote_ratio", "company_size_num", 
                    "education_num", "benefits_score", 
@@ -1127,7 +1317,7 @@ for (comb_name in names(macro_combinations)) {
     test_data  <- current_job_data[test_idx, ]
     
     # ------------------------------------------------------------------------------
-    # 1. CALCULATE MAHALANOBIS DISTANCE ONLY ON TRAINING DATA
+    # 1. CALCULATE DISTANCE MATRIX ON TRAINING DATA
     # ------------------------------------------------------------------------------
     train_country_summary <- train_data %>%
       group_by(company_location) %>%
@@ -1146,15 +1336,24 @@ for (comb_name in names(macro_combinations)) {
     train_country_summary <- train_country_summary %>% left_join(macro_summary[, c("company_location", current_macro_vars)], by = "company_location")
     
     macro_mat_train <- as.matrix(train_country_summary[, current_macro_vars, drop = FALSE])
-    cov_matrix_train <- cov(macro_mat_train)
-    if (length(current_macro_vars) == 1) cov_matrix_train <- matrix(cov_matrix_train, 1, 1)
-    diag(cov_matrix_train) <- diag(cov_matrix_train) + 1e-6 
-    inv_cov_matrix_train <- solve(cov_matrix_train)
-    
     train_dist_matrix <- matrix(0, nrow = nrow(train_country_summary), ncol = nrow(train_country_summary))
-    for(i in 1:nrow(train_country_summary)) {
-      diff_matrix <- sweep(macro_mat_train, 2, as.numeric(macro_mat_train[i, ]), "-")
-      train_dist_matrix[i, ] <- sqrt(rowSums((diff_matrix %*% inv_cov_matrix_train) * diff_matrix))
+    
+    if(distance_method == "mahalanobis") {
+      cov_matrix_train <- cov(macro_mat_train)
+      if (length(current_macro_vars) == 1) cov_matrix_train <- matrix(cov_matrix_train, 1, 1)
+      diag(cov_matrix_train) <- diag(cov_matrix_train) + 1e-6 
+      inv_cov_matrix_train <- solve(cov_matrix_train)
+      
+      for(i in 1:nrow(train_country_summary)) {
+        diff_matrix <- sweep(macro_mat_train, 2, as.numeric(macro_mat_train[i, ]), "-")
+        train_dist_matrix[i, ] <- sqrt(rowSums((diff_matrix %*% inv_cov_matrix_train) * diff_matrix))
+      }
+    } else {
+      # Default to Euclidean Distance
+      for(i in 1:nrow(train_country_summary)) {
+        diff_matrix <- sweep(macro_mat_train, 2, as.numeric(macro_mat_train[i, ]), "-")
+        train_dist_matrix[i, ] <- sqrt(rowSums(diff_matrix^2))
+      }
     }
     rownames(train_dist_matrix) <- train_country_summary$company_location
     colnames(train_dist_matrix) <- train_country_summary$company_location
@@ -1192,7 +1391,12 @@ for (comb_name in names(macro_combinations)) {
       test_country_macro <- as.matrix(econ_lookup[econ_lookup$company_location == test_country, current_macro_vars, drop = FALSE])
       
       diff_matrix <- sweep(macro_mat_train, 2, as.numeric(test_country_macro), "-")
-      dist_to_train <- sqrt(rowSums((diff_matrix %*% inv_cov_matrix_train) * diff_matrix))
+      
+      if(distance_method == "mahalanobis") {
+        dist_to_train <- sqrt(rowSums((diff_matrix %*% inv_cov_matrix_train) * diff_matrix))
+      } else {
+        dist_to_train <- sqrt(rowSums(diff_matrix^2))
+      }
       
       inv_weights <- 1 / (dist_to_train + 1e-6)
       normalized_weights <- inv_weights / sum(inv_weights)
@@ -1239,9 +1443,9 @@ for (comb_name in names(macro_combinations)) {
   }
   
   # ==============================================================================
-  # 5. EVALUATION: AGGREGATE TO COUNTRY LEVEL FOR MORAN'S I 
+  # 5. EVALUATION: INDIVIDUAL ROW LEVEL (15,000 Records - Weighted by Dataset Composition)
   # ==============================================================================
-  cat("Evaluating Metrics and Residual Autocorrelation...\n")
+  cat("Evaluating Metrics and Residual Autocorrelation on full dataset...\n")
   
   # 1. Calculate overall RMSE and R-Squared at the individual row level
   resids_raw <- current_job_data$salary_usd - current_job_data$pred_xgb_spatial_raw
@@ -1253,37 +1457,35 @@ for (comb_name in names(macro_combinations)) {
   rmse_raw <- sqrt(mean(resids_raw^2))
   rmse_log <- sqrt(mean(resids_log^2))
   
-  # 2. Aggregate residuals to the country level for valid Spatial Autocorrelation testing
-  country_eval <- current_job_data %>%
-    group_by(company_location) %>%
-    summarise(
-      mean_resid_raw = mean(salary_usd - pred_xgb_spatial_raw, na.rm = TRUE),
-      mean_resid_log = mean(salary_usd - pred_xgb_spatial_log, na.rm = TRUE)
-    ) %>%
-    ungroup()
+  # 2. Build Full Row-Level Distance Matrix
+  macro_mat_full <- as.matrix(current_job_data[, current_macro_vars, drop = FALSE])
+  full_mahalanobis_dist <- matrix(0, nrow = nrow(current_job_data), ncol = nrow(current_job_data))
+  
+  if(distance_method == "mahalanobis") {
+    cov_matrix_full <- cov(macro_mat_full)
+    if (length(current_macro_vars) == 1) cov_matrix_full <- matrix(cov_matrix_full, 1, 1)
+    diag(cov_matrix_full) <- diag(cov_matrix_full) + 1e-6 
+    inv_cov_matrix_full <- solve(cov_matrix_full)
     
-  macro_eval <- econ_lookup %>% filter(company_location %in% country_eval$company_location)
-  country_eval <- country_eval %>% left_join(macro_eval[, c("company_location", current_macro_vars)], by = "company_location")
-  
-  # 3. Build a Country-Level Mahalanobis Weight Matrix
-  macro_mat_eval <- as.matrix(country_eval[, current_macro_vars, drop = FALSE])
-  cov_matrix_eval <- cov(macro_mat_eval)
-  if (length(current_macro_vars) == 1) cov_matrix_eval <- matrix(cov_matrix_eval, 1, 1)
-  diag(cov_matrix_eval) <- diag(cov_matrix_eval) + 1e-6 
-  inv_cov_matrix_eval <- solve(cov_matrix_eval)
-  
-  country_dist_matrix <- matrix(0, nrow = nrow(country_eval), ncol = nrow(country_eval))
-  for(i in 1:nrow(country_eval)) {
-    diff_matrix <- sweep(macro_mat_eval, 2, as.numeric(macro_mat_eval[i, ]), "-")
-    country_dist_matrix[i, ] <- sqrt(rowSums((diff_matrix %*% inv_cov_matrix_eval) * diff_matrix))
+    for(i in 1:nrow(current_job_data)) {
+      diff_matrix <- sweep(macro_mat_full, 2, as.numeric(macro_mat_full[i, ]), "-")
+      full_mahalanobis_dist[i, ] <- sqrt(rowSums((diff_matrix %*% inv_cov_matrix_full) * diff_matrix))
+    }
+  } else {
+    # Default to Euclidean Distance
+    for(i in 1:nrow(current_job_data)) {
+      diff_matrix <- sweep(macro_mat_full, 2, as.numeric(macro_mat_full[i, ]), "-")
+      full_mahalanobis_dist[i, ] <- sqrt(rowSums(diff_matrix^2))
+    }
   }
   
-  inv_dist_weights_eval <- 1 / (country_dist_matrix + 1e-6)
-  diag(inv_dist_weights_eval) <- 0
+  # 3. THE ROW-LEVEL FIX: Use 1 / (Distance + 1)
+  inv_dist_weights_full <- 1 / (full_mahalanobis_dist + 1)
+  diag(inv_dist_weights_full) <- 0 # A row cannot be its own neighbor
   
-  # 4. Calculate Moran's I on the Country-Averaged Residuals
-  moran_raw <- Moran.I(country_eval$mean_resid_raw, inv_dist_weights_eval)
-  moran_log <- Moran.I(country_eval$mean_resid_log, inv_dist_weights_eval)
+  # 4. Calculate Moran's I on all ~15,000 residuals
+  moran_raw <- Moran.I(resids_raw, inv_dist_weights_full)
+  moran_log <- Moran.I(resids_log, inv_dist_weights_full)
   
   ablation_results_sxgb <- rbind(
     ablation_results_sxgb,
@@ -1302,12 +1504,15 @@ print(ablation_results_sxgb)
 ```{r normal XGBoost}
 # ==============================================================================
 # ABLATION STUDY: NORMAL XGBOOST (RAW VS LOG) - NESTED CV ENHANCED
-# (Updated with Spatial Block CV & Country-Level Moran's I Evaluation)
+# (Updated with Distance Toggle, Spatial Block CV & Row-Level Moran's I Evaluation)
 # ==============================================================================
 library(xgboost)
 library(dplyr)
 library(ape)   # Using ape for consistent Moran's I evaluation
 library(stats) # Required for cov()
+
+# --- NEW: DISTANCE TOGGLE ---
+distance_method <- "mahalanobis" # Change to "mahalanobis" or "euclidean" to toggle distance calculation
 
 # 0. DEFINE ABLATION COMBINATIONS & STORAGE
 macro_combinations <- list(
@@ -1440,8 +1645,8 @@ for (comb_name in names(macro_combinations)) {
     current_job_data$pred_xgb_normal_log[test_idx] <- exp(predict(model_xgb_log_fold, dtest_log))
   }
   
-  # --- C. EVALUATION: AGGREGATE TO COUNTRY LEVEL FOR MORAN'S I ---
-  cat("Evaluating Metrics and Residual Autocorrelation...\n")
+  # --- C. EVALUATION: INDIVIDUAL ROW LEVEL (15,000 Records - Weighted by Dataset Composition) ---
+  cat("Evaluating Metrics and Residual Autocorrelation on full dataset...\n")
   
   # 1. Calculate overall RMSE and R-Squared at the individual row level
   resids_raw <- current_job_data$salary_usd - current_job_data$pred_xgb_normal_raw
@@ -1453,37 +1658,35 @@ for (comb_name in names(macro_combinations)) {
   rmse_raw <- sqrt(mean(resids_raw^2))
   rmse_log <- sqrt(mean(resids_log^2))
   
-  # 2. Aggregate residuals to the country level for valid Spatial Autocorrelation testing
-  country_eval <- current_job_data %>%
-    group_by(company_location) %>%
-    summarise(
-      mean_resid_raw = mean(salary_usd - pred_xgb_normal_raw, na.rm = TRUE),
-      mean_resid_log = mean(salary_usd - pred_xgb_normal_log, na.rm = TRUE)
-    ) %>%
-    ungroup()
+  # 2. Build Full Row-Level Distance Matrix based on selected method
+  macro_mat_full <- as.matrix(current_job_data[, current_macro_vars, drop = FALSE])
+  full_mahalanobis_dist <- matrix(0, nrow = nrow(current_job_data), ncol = nrow(current_job_data))
+  
+  if(distance_method == "mahalanobis") {
+    cov_matrix_full <- cov(macro_mat_full)
+    if (length(current_macro_vars) == 1) cov_matrix_full <- matrix(cov_matrix_full, 1, 1)
+    diag(cov_matrix_full) <- diag(cov_matrix_full) + 1e-6 
+    inv_cov_matrix_full <- solve(cov_matrix_full)
     
-  macro_eval <- econ_lookup %>% filter(company_location %in% country_eval$company_location)
-  country_eval <- country_eval %>% left_join(macro_eval[, c("company_location", current_macro_vars)], by = "company_location")
-  
-  # 3. Build a Country-Level Mahalanobis Weight Matrix
-  macro_mat_eval <- as.matrix(country_eval[, current_macro_vars, drop = FALSE])
-  cov_matrix_eval <- cov(macro_mat_eval)
-  if (length(current_macro_vars) == 1) cov_matrix_eval <- matrix(cov_matrix_eval, 1, 1)
-  diag(cov_matrix_eval) <- diag(cov_matrix_eval) + 1e-6 
-  inv_cov_matrix_eval <- solve(cov_matrix_eval)
-  
-  country_dist_matrix <- matrix(0, nrow = nrow(country_eval), ncol = nrow(country_eval))
-  for(i in 1:nrow(country_eval)) {
-    diff_matrix <- sweep(macro_mat_eval, 2, as.numeric(macro_mat_eval[i, ]), "-")
-    country_dist_matrix[i, ] <- sqrt(rowSums((diff_matrix %*% inv_cov_matrix_eval) * diff_matrix))
+    for(i in 1:nrow(current_job_data)) {
+      diff_matrix <- sweep(macro_mat_full, 2, as.numeric(macro_mat_full[i, ]), "-")
+      full_mahalanobis_dist[i, ] <- sqrt(rowSums((diff_matrix %*% inv_cov_matrix_full) * diff_matrix))
+    }
+  } else {
+    # Default to Euclidean Distance
+    for(i in 1:nrow(current_job_data)) {
+      diff_matrix <- sweep(macro_mat_full, 2, as.numeric(macro_mat_full[i, ]), "-")
+      full_mahalanobis_dist[i, ] <- sqrt(rowSums(diff_matrix^2))
+    }
   }
   
-  inv_dist_weights_eval <- 1 / (country_dist_matrix + 1e-6)
-  diag(inv_dist_weights_eval) <- 0
+  # 3. THE ROW-LEVEL FIX: Use 1 / (Distance + 1)
+  inv_dist_weights_full <- 1 / (full_mahalanobis_dist + 1)
+  diag(inv_dist_weights_full) <- 0 # A row cannot be its own neighbor
   
-  # 4. Calculate Moran's I on the Country-Averaged Residuals
-  moran_raw <- Moran.I(country_eval$mean_resid_raw, inv_dist_weights_eval)
-  moran_log <- Moran.I(country_eval$mean_resid_log, inv_dist_weights_eval)
+  # 4. Calculate Moran's I on all ~15,000 residuals
+  moran_raw <- Moran.I(resids_raw, inv_dist_weights_full)
+  moran_log <- Moran.I(resids_log, inv_dist_weights_full)
   
   # Append to results
   ablation_results_nxgb <- rbind(
